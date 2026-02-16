@@ -1,0 +1,14 @@
+{
+  "whisper_cli_path": "~/whisper.cpp/build/bin/whisper-cli",
+  "models_dir": "~/whisper.cpp/models",
+  "model": "ggml-small.en.bin",
+  "recording_max_seconds": 180,
+  "recording_warn_before_seconds": 15,
+  "transcribe_timeout_seconds": 90,
+  "no_gpu": true,
+  "language": "en",
+  "auto_paste_current_focus": false,
+  "copy_to_clipboard_when_started_from_gui": false,
+  "paste_fallback_for_hotkey": true,
+  "restore_clipboard_after_paste": true
+}

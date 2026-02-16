@@ -1,0 +1,14 @@
+[Unit]
+Description=Voice Reading GUI Controller
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/yaronbayrobee/Voice_typing/voice_reading.py gui
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+

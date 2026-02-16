@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.voice-typing-config/
+*.log
+
+piper_runtime/
+piper_voices/
+
+.DS_Store
