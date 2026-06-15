@@ -747,6 +747,76 @@ def choose_preferred_piper_model(model_paths: list[str]) -> str:
     return model_paths[0]
 
 
+PIPER_VOICES_BASE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
+PIPER_VOICES_INDEX = SCRIPT_DIR / "piper_voices" / "index" / "voices.json"
+PIPER_DOWNLOAD_DIR = SCRIPT_DIR / "piper_voices"
+
+
+def list_gb_voice_catalog() -> list[dict[str, Any]]:
+    """British (en_GB) Piper voices from the bundled index, with install state."""
+    try:
+        data = json.loads(PIPER_VOICES_INDEX.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    catalog: list[dict[str, Any]] = []
+    for key, info in sorted(data.items()):
+        if not key.startswith("en_GB"):
+            continue
+        files = info.get("files", {}) if isinstance(info, dict) else {}
+        onnx_files = [name for name in files if name.endswith(".onnx")]
+        if not onnx_files:
+            continue
+        rel_onnx = onnx_files[0]
+        size_mb = sum(int(meta.get("size_bytes", 0)) for meta in files.values() if isinstance(meta, dict)) // (1024 * 1024)
+        catalog.append(
+            {
+                "key": key,
+                "quality": str(info.get("quality", "")),
+                "size_mb": size_mb,
+                "onnx": rel_onnx,
+                "json": rel_onnx + ".json",
+                "installed": (PIPER_DOWNLOAD_DIR / rel_onnx).exists(),
+            }
+        )
+    return catalog
+
+
+def download_piper_voice(key: str, progress: Callable[[str], None] | None = None) -> tuple[bool, str]:
+    """Fetch a voice (.onnx + .onnx.json) from rhasspy/piper-voices on
+    Hugging Face into the repo's piper_voices directory."""
+    import urllib.request
+
+    entry = next((item for item in list_gb_voice_catalog() if item["key"] == key), None)
+    if entry is None:
+        return False, f"Unknown voice: {key} (see list-gb-voices)"
+    if entry["installed"]:
+        return True, f"{key} is already installed"
+
+    for rel_path in (entry["onnx"], entry["json"]):
+        url = f"{PIPER_VOICES_BASE_URL}/{rel_path}"
+        dest = PIPER_DOWNLOAD_DIR / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_suffix(dest.suffix + ".part")
+        try:
+            if progress:
+                progress(f"Downloading {Path(rel_path).name}...")
+            with urllib.request.urlopen(url, timeout=60) as resp, part.open("wb") as out:
+                done = 0
+                while True:
+                    block = resp.read(1024 * 256)
+                    if not block:
+                        break
+                    out.write(block)
+                    done += len(block)
+                    if progress and done % (1024 * 1024 * 4) < 1024 * 256:
+                        progress(f"Downloading {Path(rel_path).name}... {done // (1024 * 1024)} MB")
+            part.replace(dest)
+        except Exception as exc:
+            part.unlink(missing_ok=True)
+            return False, f"Download failed for {url}: {exc}"
+    return True, f"Installed {key} ({entry['size_mb']} MB). Click Refresh Models to use it."
+
+
 class ReaderController:
     def __init__(
         self,
@@ -1504,22 +1574,30 @@ class VoiceReadingGui:
         root = ttk.Frame(self.root, padding=10, style="VR.Root.TFrame")
         root.pack(fill="both", expand=True)
 
-        top = ttk.Frame(root, style="VR.Card.TFrame", padding=(8, 8))
-        top.pack(fill="x")
-        self.dot = tk.Canvas(top, width=12, height=12, highlightthickness=0, bd=0, bg="#11231c")
-        self.dot.pack(side="left", padx=(0, 6))
-        self.dot_indicator = self.dot.create_oval(1, 1, 11, 11, fill="#22c55e", outline="")
-        ttk.Label(top, textvariable=self.status_var, style="VR.Status.TLabel").pack(side="left")
-        ttk.Button(top, text="Read Selection", style="VR.TButton", command=self._read_from_gui).pack(side="right")
+        # Plain tk widgets so the whole bar can change color with state.
+        self.status_bar = tk.Frame(root, bg="#11231c", padx=10, pady=8)
+        self.status_bar.pack(fill="x")
+        self.dot = tk.Canvas(self.status_bar, width=18, height=18, highlightthickness=0, bd=0, bg="#11231c")
+        self.dot.pack(side="left", padx=(0, 8))
+        self.dot_indicator = self.dot.create_oval(2, 2, 16, 16, fill="#475569", outline="")
+        self.status_label = tk.Label(
+            self.status_bar,
+            textvariable=self.status_var,
+            font=("DejaVu Sans Mono", 13, "bold"),
+            fg="#94a3b8",
+            bg="#11231c",
+        )
+        self.status_label.pack(side="left")
+        ttk.Button(self.status_bar, text="Read Selection", style="VR.TButton", command=self._read_from_gui).pack(side="right")
         self.pause_btn = ttk.Button(
-            top,
+            self.status_bar,
             textvariable=self.pause_btn_var,
             style="VR.TButton",
             command=self._pause_resume_from_gui,
             state="disabled",
         )
         self.pause_btn.pack(side="right", padx=(0, 6))
-        ttk.Button(top, text="Stop", style="VR.TButton", command=self._stop_from_gui).pack(side="right", padx=(0, 6))
+        ttk.Button(self.status_bar, text="Stop", style="VR.TButton", command=self._stop_from_gui).pack(side="right", padx=(0, 6))
 
         ttk.Label(root, textvariable=self.source_var, style="VR.Meta.TLabel").pack(anchor="w", pady=(4, 6))
 
@@ -1667,6 +1745,9 @@ class VoiceReadingGui:
         footer.pack(fill="x", pady=(6, 0))
         ttk.Button(footer, text="Apply", style="VR.TButton", command=self._save_options).pack(side="right")
         ttk.Button(footer, text="Refresh Models", style="VR.TButton", command=self._refresh_model_lists).pack(
+            side="right", padx=(0, 6)
+        )
+        ttk.Button(footer, text="Get GB Voices", style="VR.TButton", command=self._open_voice_downloader).pack(
             side="right", padx=(0, 6)
         )
         ttk.Button(footer, text="Help", style="VR.TButton", command=self._show_help).pack(side="right", padx=(0, 6))
@@ -1838,6 +1919,121 @@ class VoiceReadingGui:
         if not ok:
             self.status_var.set(message)
 
+    def _set_visual_state(self, state: str) -> None:
+        palettes = {
+            "idle": {"bar": "#11231c", "fg": "#94a3b8", "dot": "#475569", "title": APP_NAME},
+            "reading": {"bar": "#14532d", "fg": "#dcfce7", "dot": "#4ade80", "title": f"▶ READING — {APP_NAME}"},
+            "paused": {"bar": "#78350f", "fg": "#ffedd5", "dot": "#fbbf24", "title": f"‖ Paused — {APP_NAME}"},
+            "error": {"bar": "#7f1d1d", "fg": "#fee2e2", "dot": "#f87171", "title": f"Error — {APP_NAME}"},
+        }
+        palette = palettes.get(state, palettes["idle"])
+        self.status_bar.configure(bg=palette["bar"])
+        self.dot.configure(bg=palette["bar"])
+        self.dot.itemconfig(self.dot_indicator, fill=palette["dot"])
+        self.status_label.configure(bg=palette["bar"], fg=palette["fg"])
+        try:
+            self.root.title(palette["title"])
+        except Exception:
+            pass
+
+    def _open_voice_downloader(self) -> None:
+        catalog = list_gb_voice_catalog()
+        if not catalog:
+            messagebox.showerror(APP_NAME, "Bundled voice index not found (piper_voices/index/voices.json).")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Download British Voices")
+        dialog.configure(bg="#0f1115", padx=12, pady=12)
+        dialog.transient(self.root)
+
+        tk.Label(
+            dialog,
+            text="British (en_GB) Piper voices — downloaded from Hugging Face into piper_voices/",
+            font=("DejaVu Sans Mono", 9),
+            fg="#94a3b8",
+            bg="#0f1115",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+
+        listbox = tk.Listbox(
+            dialog,
+            height=min(12, len(catalog)),
+            width=64,
+            bg="#0b1410",
+            fg="#ecfdf5",
+            selectbackground="#14532d",
+            font=("DejaVu Sans Mono", 10),
+            activestyle="none",
+        )
+        for item in catalog:
+            mark = "  [installed]" if item["installed"] else ""
+            listbox.insert("end", f"{item['key']}  ({item['quality']}, {item['size_mb']} MB){mark}")
+        listbox.pack(fill="both", expand=True)
+
+        progress_var = tk.StringVar(value="")
+        tk.Label(
+            dialog,
+            textvariable=progress_var,
+            font=("DejaVu Sans Mono", 9),
+            fg="#34d399",
+            bg="#0f1115",
+            anchor="w",
+        ).pack(fill="x", pady=(8, 4))
+
+        def _download_selected() -> None:
+            selection = listbox.curselection()
+            if not selection:
+                progress_var.set("Select a voice first.")
+                return
+            entry = catalog[selection[0]]
+            if entry["installed"]:
+                progress_var.set(f"{entry['key']} is already installed.")
+                return
+            download_btn.configure(state="disabled")
+            progress_var.set(f"Starting download of {entry['key']}...")
+
+            def _work() -> None:
+                ok, message = download_piper_voice(
+                    entry["key"],
+                    progress=lambda msg: self.events.put(("voice_download", msg, None)),
+                )
+                self.events.put(("voice_download", message, "done" if ok else "error"))
+
+            def _poll() -> None:
+                # Route download progress into this dialog while it is open.
+                drained = []
+                try:
+                    while True:
+                        item = self.events.get_nowait()
+                        if item[0] == "voice_download":
+                            progress_var.set(str(item[1]))
+                            if item[2] == "done":
+                                download_btn.configure(state="normal")
+                                self._refresh_model_lists()
+                                return
+                            if item[2] == "error":
+                                download_btn.configure(state="normal")
+                                return
+                        else:
+                            drained.append(item)
+                except queue.Empty:
+                    pass
+                finally:
+                    for item in drained:
+                        self.events.put(item)
+                if dialog.winfo_exists():
+                    dialog.after(200, _poll)
+
+            threading.Thread(target=_work, daemon=True).start()
+            _poll()
+
+        button_row = tk.Frame(dialog, bg="#0f1115")
+        button_row.pack(fill="x")
+        download_btn = ttk.Button(button_row, text="Download Selected", style="VR.TButton", command=_download_selected)
+        download_btn.pack(side="left")
+        ttk.Button(button_row, text="Close", style="VR.TButton", command=dialog.destroy).pack(side="right")
+
     def _tick(self) -> None:
         self._drain_events()
         self.root.after(200, self._tick)
@@ -1853,25 +2049,26 @@ class VoiceReadingGui:
                 speaking = bool(data)
                 reason = str(meta)
                 if speaking:
-                    self.status_var.set("Reading...")
-                    self.dot.itemconfig(self.dot_indicator, fill="#dc2626")
+                    self.status_var.set("▶ READING")
+                    self._set_visual_state("reading")
                     self._is_paused = False
                     self.pause_btn_var.set("Pause")
                     self.pause_btn.configure(state="normal")
                 else:
-                    self.dot.itemconfig(self.dot_indicator, fill="#16a34a")
                     status = {
                         "done": "Ready",
                         "stopped": "Stopped",
-                        "paused": "Paused",
+                        "paused": "‖ PAUSED",
                         "error": "Error",
                     }.get(reason, "Idle")
                     self.status_var.set(status)
                     if reason == "paused":
+                        self._set_visual_state("paused")
                         self._is_paused = True
                         self.pause_btn_var.set("Resume")
                         self.pause_btn.configure(state="normal")
                     else:
+                        self._set_visual_state("error" if reason == "error" else "idle")
                         self._is_paused = False
                         self.pause_btn_var.set("Pause")
                         self.pause_btn.configure(state="disabled")
@@ -2100,6 +2297,10 @@ def main() -> int:
     sub.add_parser("read", help="Read selected text")
     sub.add_parser("stop", help="Stop reading")
     sub.add_parser("status", help="Show server status")
+    sub.add_parser("list-gb-voices", help="List downloadable British piper voices")
+
+    download_parser = sub.add_parser("download-voice", help="Download a British piper voice")
+    download_parser.add_argument("voice", help="Voice key from list-gb-voices (example: en_GB-jenny_dioco-medium)")
 
     args = parser.parse_args()
 
@@ -2117,6 +2318,20 @@ def main() -> int:
         return cmd_stop()
     if args.command == "status":
         return cmd_status()
+    if args.command == "list-gb-voices":
+        catalog = list_gb_voice_catalog()
+        if not catalog:
+            print("Voice index not found")
+            return 1
+        for item in catalog:
+            mark = "[installed]" if item["installed"] else ""
+            print(f"{item['key']:<42} {item['quality']:<8} {item['size_mb']:>4} MB {mark}")
+        return 0
+    if args.command == "download-voice":
+        ok, message = download_piper_voice(args.voice, progress=lambda msg: print(msg, end="\r", flush=True))
+        print()
+        print(message)
+        return 0 if ok else 1
     return 1
 
 

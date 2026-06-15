@@ -11,10 +11,14 @@ Main goals:
 from __future__ import annotations
 
 import argparse
+import ast
+import base64
 import fcntl
+import importlib.util
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import stat
@@ -22,6 +26,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -64,23 +70,90 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_DIR = Path("/tmp/voice_typing")
 SOCKET_PATH = "/tmp/voice_typing.sock"
 AUDIO_PATH = STATE_DIR / "recording.wav"
+CHUNK_DIR = STATE_DIR / "chunks"
 TRANSCRIPT_PREFIX = STATE_DIR / "transcript"
 ROUTE_LOG_PATH = STATE_DIR / "routing.log"
 SPAWN_LOCK_PATH = "/tmp/voice_typing_spawn.lock"
 TOGGLE_DEBOUNCE_PATH = "/tmp/voice_typing_toggle.debounce"
-TOGGLE_DEBOUNCE_SECONDS = 0.18
-MIN_HOTKEY_RECORDING_SECONDS_BEFORE_STOP = 0.35
+TOGGLE_DEBOUNCE_SECONDS = 0.8
+MIN_HOTKEY_RECORDING_SECONDS_BEFORE_STOP = 1.5
+GEMMA4_MAX_AUDIO_SECONDS = 30
+SUPPORTED_TRANSCRIPTION_ENGINES = ("whisper", "ollama", "gemma4-transformers")
+ENGINE_ALIASES = {
+    "gemma": "ollama",
+    "gemma4": "ollama",
+    "gemma-4": "ollama",
+}
+LEGACY_WHISPER_CLI_PATH = "~/whisper.cpp/build/bin/whisper-cli"
+CUDA_WHISPER_CLI_PATH = "~/whisper.cpp/build-cuda/bin/whisper-cli"
+
+
+def prefer_cuda_whisper_cli(data: dict[str, Any]) -> None:
+    if (
+        str(data.get("whisper_cli_path", "")).strip() == LEGACY_WHISPER_CLI_PATH
+        and Path(os.path.expanduser(CUDA_WHISPER_CLI_PATH)).exists()
+    ):
+        data["whisper_cli_path"] = CUDA_WHISPER_CLI_PATH
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "whisper_cli_path": "~/whisper.cpp/build/bin/whisper-cli",
+    "transcription_engine": "whisper",
+    "whisper_cli_path": LEGACY_WHISPER_CLI_PATH,
     "models_dir": "~/whisper.cpp/models",
     "model": "",
-    "recording_max_seconds": 180,
-    "recording_warn_before_seconds": 15,
+    "gemma_model": "google/gemma-4-E4B-it",
+    "gemma_model_path": "",
+    "gemma_backend": "pipeline",
+    "gemma_device_map": "auto",
+    "gemma_dtype": "auto",
+    "gemma_max_new_tokens": 192,
+    "gemma_transcribe_prompt": (
+        "Transcribe the following speech segment in its original language. "
+        "Follow these specific instructions for formatting the answer:\n"
+        "* Only output the transcription, with no newlines.\n"
+        "* When transcribing numbers, write the digits, i.e. write 1.7 and not one point seven, "
+        "and write 3 instead of three."
+    ),
+    "ollama_url": "http://127.0.0.1:11434",
+    "ollama_model": "gemma4:latest",
+    "ollama_timeout_seconds": 300,
+    "ollama_keep_alive": "30m",
+    "ollama_max_tokens": 512,
+    "ollama_disable_thinking": True,
+    "ollama_normalize_audio": True,
+    "assistant_answer_mode": False,
+    "answer_speak_aloud": True,
+    "answer_voice_model": "",
+    "ollama_ask_system_prompt": (
+        "You are a helpful local assistant. Answer briefly in plain text only - "
+        "no markdown, no headers, no bullet symbols. Your answer is typed "
+        "directly into the user's focused text field."
+    ),
+    "ollama_answer_max_tokens": 600,
+    "ollama_transcribe_prompt": (
+        "Transcribe this audio segment. Only output the spoken words. "
+        "If there is no speech, output nothing."
+    ),
+    "recording_max_seconds": 1800,
+    "recording_warn_before_seconds": 30,
     "transcribe_timeout_seconds": 90,
-    "no_gpu": True,
+    "audio_input_device": "",
+    "save_recordings": True,
+    "recordings_dir": "~/.local/share/voice-typing/recordings",
+    "recordings_keep": 30,
+    "streaming_transcription": False,
+    "streaming_chunk_seconds": 28,
+    "streaming_route_partials": True,
+    "no_gpu": False,
     "language": "en",
+    "voice_commands_enabled": True,
+    "voice_command_prefixes": ["voice typing", "computer", "hey antonio", "good morning antonio"],
+    "assistant_wake_mode": False,
+    "assistant_wake_phrases": ["hey antonio", "good morning antonio"],
+    "assistant_awake_seconds": 20,
+    "assistant_ask_target_when_uncertain": True,
+    "voice_prompts_enabled": False,
+    "ask_when_focus_uncertain": False,
     "auto_paste_current_focus": False,
     "copy_to_clipboard_when_started_from_gui": False,
     "direct_type_fallback_for_hotkey": True,
@@ -89,6 +162,65 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "window_always_on_top": True,
     "show_panel_on_hotkey_start": True,
     "window_opacity": 0.95,
+}
+
+PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
+    "stable": {
+        "transcription_engine": "whisper",
+        # Long dictation is normal use; the archive keeps audio safe anyway.
+        "recording_max_seconds": 1800,
+        "recording_warn_before_seconds": 30,
+        "streaming_transcription": False,
+        "streaming_chunk_seconds": 28,
+        "streaming_route_partials": True,
+        "assistant_wake_mode": False,
+        "voice_prompts_enabled": False,
+        "assistant_answer_mode": False,
+    },
+    "ask-gemma": {
+        # Best of both: Whisper transcribes the spoken question (it is far
+        # more accurate than Gemma on accented speech), gemma4 via Ollama
+        # answers it, and the answer is routed like a transcript.
+        "transcription_engine": "whisper",
+        "recording_max_seconds": 180,
+        "recording_warn_before_seconds": 15,
+        "streaming_transcription": False,
+        "assistant_wake_mode": False,
+        "voice_prompts_enabled": False,
+        "assistant_answer_mode": True,
+    },
+    "gemma-agent": {
+        # Offline agent pipeline: gemma4 through Ollama does the speech
+        # recognition so the whole stack runs without whisper.cpp or network.
+        # Gemma audio prompts are capped at 30s, so rolling chunks stay on.
+        "transcription_engine": "ollama",
+        "recording_max_seconds": 180,
+        "recording_warn_before_seconds": 15,
+        "streaming_transcription": True,
+        "streaming_chunk_seconds": 28,
+        "streaming_route_partials": True,
+        "assistant_wake_mode": False,
+        "voice_prompts_enabled": False,
+        "assistant_answer_mode": False,
+    },
+    "antonio": {
+        # Wake-word detection needs a reliable speech recognizer. The local
+        # Ollama Gemma audio model is kept available for later command
+        # reasoning, but Whisper is currently the better front-end STT.
+        "transcription_engine": "whisper",
+        "recording_max_seconds": 0,
+        "recording_warn_before_seconds": 0,
+        "streaming_transcription": True,
+        "streaming_chunk_seconds": 5,
+        "streaming_route_partials": True,
+        "assistant_wake_mode": True,
+        "assistant_wake_phrases": ["hey antonio", "good morning antonio"],
+        "voice_command_prefixes": ["voice typing", "computer", "hey antonio", "good morning antonio"],
+        "assistant_awake_seconds": 20,
+        "assistant_ask_target_when_uncertain": True,
+        "voice_prompts_enabled": True,
+        "voice_commands_enabled": True,
+    },
 }
 
 
@@ -109,6 +241,7 @@ class ConfigManager:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             data = dict(DEFAULT_CONFIG)
+            prefer_cuda_whisper_cli(data)
             self._select_default_model(data)
             self._save_best_effort(data)
             return data
@@ -121,6 +254,7 @@ class ConfigManager:
 
         data = dict(DEFAULT_CONFIG)
         data.update(loaded)
+        prefer_cuda_whisper_cli(data)
         self._select_default_model(data)
         self._save_best_effort(data)
         return data
@@ -158,6 +292,25 @@ class ConfigManager:
         if model.startswith("/"):
             return Path(model)
         return self.models_dir() / model
+
+    def transcription_engine(self) -> str:
+        engine = str(self.get("transcription_engine", "whisper")).strip().lower()
+        engine = ENGINE_ALIASES.get(engine, engine)
+        if engine not in SUPPORTED_TRANSCRIPTION_ENGINES:
+            return "whisper"
+        return engine
+
+    def gemma_model_ref(self) -> str:
+        local_path = str(self.get("gemma_model_path", "")).strip()
+        if local_path:
+            return os.path.expanduser(local_path)
+        return str(self.get("gemma_model", "google/gemma-4-E4B-it")).strip()
+
+    def ollama_url(self) -> str:
+        return str(self.get("ollama_url", "http://127.0.0.1:11434")).rstrip("/")
+
+    def ollama_model(self) -> str:
+        return str(self.get("ollama_model", "gemma4:latest")).strip()
 
     def list_models(self) -> list[str]:
         models_dir = self.models_dir()
@@ -212,6 +365,22 @@ def notify(summary: str, body: str = "", urgency: str = "normal") -> None:
         pass
 
 
+def speak_prompt(text: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    if shutil.which("spd-say") is None:
+        return
+    try:
+        subprocess.Popen(
+            ["spd-say", text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
 def log_routing(message: str) -> None:
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -220,6 +389,180 @@ def log_routing(message: str) -> None:
             f.write(f"[{ts}] {message}\n")
     except Exception:
         pass
+
+
+def audio_duration_seconds(path: Path) -> float:
+    """Duration of a PCM WAV file; 0.0 if it cannot be determined."""
+    try:
+        import wave
+
+        with wave.open(str(path), "rb") as wav:
+            frames = wav.getnframes()
+            rate = wav.getframerate() or 1
+            return frames / float(rate)
+    except Exception:
+        return 0.0
+
+
+def analyze_audio_quality(path: Path) -> tuple[str, str]:
+    """Cheap microphone-quality check via `sox ... -n stats` (reads the PCM
+    once in C; negligible load). Returns (verdict, detail), empty on failure.
+    Verdicts: good | quiet | very_quiet | clipping | silent."""
+    try:
+        result = subprocess.run(
+            ["sox", str(path), "-n", "stats"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception:
+        return "", ""
+    rms_db: float | None = None
+    peak_db: float | None = None
+    for line in (result.stderr or "").splitlines():
+        parts = line.split()
+        if line.startswith("RMS lev dB") and len(parts) >= 4:
+            try:
+                rms_db = float(parts[3])
+            except ValueError:
+                pass
+        elif line.startswith("Pk lev dB") and len(parts) >= 4:
+            try:
+                peak_db = float(parts[3])
+            except ValueError:
+                pass
+    if rms_db is None or peak_db is None:
+        return "", ""
+    detail = f"RMS {rms_db:.0f} dB, peak {peak_db:.0f} dB"
+    if rms_db < -60:
+        return "silent", detail
+    if peak_db > -1.0:
+        return "clipping", detail
+    if rms_db < -45:
+        return "very_quiet", detail
+    if rms_db < -35:
+        return "quiet", detail
+    return "good", detail
+
+
+AUDIO_QUALITY_LABELS = {
+    "good": "Mic OK",
+    "quiet": "Mic quiet — consider raising input volume",
+    "very_quiet": "Mic very quiet — check microphone setup",
+    "silent": "No signal — wrong input device?",
+    "clipping": "Mic clipping — lower input gain",
+}
+
+
+def sox_input_args(config: Any) -> tuple[list[str], dict[str, str] | None]:
+    device = str(config.get("audio_input_device", "")).strip()
+    if not device or device in {"default", "-d"}:
+        return ["-d"], None
+    if device.startswith("pulse:"):
+        env = os.environ.copy()
+        env["PULSE_SOURCE"] = device.split(":", 1)[1]
+        return ["-t", "alsa", "pulse"], env
+    if device.startswith("alsa:"):
+        device = device.split(":", 1)[1]
+    return ["-t", "alsa", device], None
+
+
+def _ollama_loaded_models(base_url: str, timeout: float = 3.0) -> list[dict[str, Any]]:
+    """Models currently loaded in memory (GET /api/ps); empty on failure."""
+    try:
+        req = urllib.request.Request(f"{base_url}/api/ps")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return []
+    models = payload.get("models", []) if isinstance(payload, dict) else []
+    return [item for item in models if isinstance(item, dict)]
+
+
+def list_ollama_models(base_url: str, timeout: float = 3.0) -> list[str]:
+    """Return model names known to the local Ollama server (empty on failure)."""
+    try:
+        req = urllib.request.Request(f"{base_url}/api/tags")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return []
+    models = payload.get("models", []) if isinstance(payload, dict) else []
+    names = [str(item.get("name", "")) for item in models if isinstance(item, dict)]
+    return sorted(name for name in names if name)
+
+
+def _normalize_command_text(text: str) -> str:
+    lowered = text.lower()
+    lowered = re.sub(r"[^a-z0-9\s-]", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def strip_leading_phrase(text: str, phrases: list[str]) -> tuple[bool, str]:
+    stripped = text.strip()
+    for phrase in sorted((p for p in phrases if str(p).strip()), key=len, reverse=True):
+        words = [re.escape(part) for part in _normalize_command_text(str(phrase)).split()]
+        if not words:
+            continue
+        pattern = r"^\s*" + r"[\s,.;:!?-]+".join(words) + r"[\s,.;:!?-]*(.*)$"
+        match = re.match(pattern, stripped, flags=re.IGNORECASE)
+        if match:
+            return True, match.group(1).strip()
+    return False, text
+
+
+def parse_voice_command(text: str, prefixes: list[str]) -> tuple[str, str] | None:
+    """Return (command, argument) when transcript is a control command."""
+    normalized = _normalize_command_text(text)
+    if not normalized:
+        return None
+
+    command_text = ""
+    normalized_prefixes = [_normalize_command_text(prefix) for prefix in prefixes if str(prefix).strip()]
+    for prefix in normalized_prefixes:
+        if normalized == prefix:
+            command_text = ""
+            break
+        if normalized.startswith(prefix + " "):
+            command_text = normalized[len(prefix) :].strip()
+            break
+    else:
+        # A tiny set of direct commands is allowed without prefix because they
+        # are unlikely dictation phrases and are useful while hands-free.
+        direct_commands = ("stop listening", "stop recording", "cancel dictation")
+        if normalized in direct_commands:
+            command_text = normalized
+        else:
+            return None
+
+    if not command_text:
+        return "status", ""
+    if command_text in {"stop", "stop listening", "stop recording", "finish", "finish listening"}:
+        return "stop_listening", ""
+    if command_text in {"cancel", "cancel dictation", "discard", "discard that"}:
+        return "cancel", ""
+    if command_text in {"paste last", "apply last", "insert last"}:
+        return "paste_last", ""
+    if command_text in {"copy last", "copy that"}:
+        return "copy_last", ""
+    if command_text in {"focus original", "restore focus", "go back"}:
+        return "focus_original", ""
+    if command_text in {"list windows", "open windows", "what windows are open", "which windows are open"}:
+        return "list_windows", ""
+    if command_text in {"where can you write", "where should you write", "where can you type"}:
+        return "prompt_target", ""
+    if command_text.startswith("write "):
+        return "dictate", command_text.removeprefix("write ").strip()
+    if command_text.startswith("type "):
+        return "dictate", command_text.removeprefix("type ").strip()
+    if command_text.startswith("use "):
+        return "focus_window", command_text.removeprefix("use ").strip()
+    if command_text.startswith("switch to "):
+        return "focus_window", command_text.removeprefix("switch to ").strip()
+    if command_text.startswith("focus "):
+        return "focus_window", command_text.removeprefix("focus ").strip()
+    return None
 
 
 def _find_focused_accessible(node: Any) -> Any | None:
@@ -622,6 +965,208 @@ def activate_window_by_pid(pid: int | None) -> bool:
         return False
 
 
+def activate_window_by_query(query: str) -> bool:
+    """Best-effort focus by title or WM class for voice commands like "focus firefox"."""
+    query = query.strip().lower()
+    if not query:
+        return False
+    if shutil.which("gdbus") is None:
+        return False
+    quoted_query = json.dumps(query)
+    js = (
+        "(function() {"
+        f"  let q = {quoted_query};"
+        "  let actors = global.get_window_actors();"
+        "  for (let actor of actors) {"
+        "    let w = actor.meta_window;"
+        "    let hay = ((w.get_title && w.get_title()) || '') + ' ' + "
+        "              ((w.get_wm_class && w.get_wm_class()) || '');"
+        "    if (hay.toLowerCase().includes(q)) {"
+        "      w.activate(global.get_current_time());"
+        "      return 'activated';"
+        "    }"
+        "  }"
+        "  return 'not_found';"
+        "})()"
+    )
+    try:
+        result = subprocess.run(
+            [
+                "gdbus", "call", "--session",
+                "--dest", "org.gnome.Shell",
+                "--object-path", "/org/gnome/Shell",
+                "--method", "org.gnome.Shell.Eval",
+                js,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+        ok = result.returncode == 0 and "activated" in (result.stdout or "")
+        if ok:
+            log_routing(f"gdbus: activated window for query={query!r}")
+        else:
+            log_routing(f"gdbus: no window matched query={query!r}")
+        return ok
+    except Exception as exc:
+        log_routing(f"gdbus: activation failed for query={query!r} ({exc})")
+        return False
+
+
+def _extract_gdbus_eval_string(stdout: str) -> str | None:
+    text = stdout.strip()
+    match = re.match(r"^\((true|false),\s*(.*)\)$", text, flags=re.DOTALL)
+    if not match or match.group(1) != "true":
+        return None
+    raw_value = match.group(2).strip()
+    try:
+        value = ast.literal_eval(raw_value)
+    except Exception:
+        return None
+    return str(value)
+
+
+def list_open_windows(limit: int = 8) -> list[dict[str, Any]]:
+    if shutil.which("gdbus") is not None:
+        js = (
+            "(function() {"
+            "  let windows = global.get_window_actors().map((actor, idx) => {"
+            "    let w = actor.meta_window;"
+            "    return {"
+            "      index: idx + 1,"
+            "      title: ((w.get_title && w.get_title()) || ''),"
+            "      wm_class: ((w.get_wm_class && w.get_wm_class()) || ''),"
+            "      pid: w.get_pid()"
+            "    };"
+            "  }).filter(w => w.title || w.wm_class);"
+            f"  return JSON.stringify(windows.slice(0, {int(limit)}));"
+            "})()"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "gdbus", "call", "--session",
+                    "--dest", "org.gnome.Shell",
+                    "--object-path", "/org/gnome/Shell",
+                    "--method", "org.gnome.Shell.Eval",
+                    js,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+            )
+            if result.returncode == 0:
+                json_text = _extract_gdbus_eval_string(result.stdout or "")
+                if json_text:
+                    parsed = json.loads(json_text)
+                    if isinstance(parsed, list):
+                        return [item for item in parsed if isinstance(item, dict)]
+            else:
+                log_routing(f"gdbus: window list failed rc={result.returncode} stderr={result.stderr.strip()!r}")
+        except Exception as exc:
+            log_routing(f"gdbus: window list failed ({exc})")
+
+    return list_open_windows_atspi(limit=limit)
+
+
+def list_open_windows_atspi(limit: int = 8) -> list[dict[str, Any]]:
+    if pyatspi is None:
+        return []
+    # pyatspi/dbind can abort the process when the accessibility bus is not
+    # available, so probe it in a child process and treat crashes as no result.
+    code = r"""
+import json
+import pyatspi
+
+limit = int(__import__("sys").argv[1])
+desktop = pyatspi.Registry.getDesktop(0)
+windows = []
+seen = set()
+skip = {"gnome-shell", "mutter", "voice typing"}
+for index in range(int(desktop.childCount)):
+    if len(windows) >= limit:
+        break
+    app = desktop.getChildAtIndex(index)
+    app_name = str(getattr(app, "name", "") or "").strip()
+    if not app_name or app_name.lower() in skip:
+        continue
+    app_pid = None
+    try:
+        app_pid = int(app.queryApplication().get_process_id())
+    except Exception:
+        pass
+    found = False
+    try:
+        child_count = int(app.childCount)
+    except Exception:
+        child_count = 0
+    for child_index in range(child_count):
+        if len(windows) >= limit:
+            break
+        try:
+            child = app.getChildAtIndex(child_index)
+            role = str(child.getRoleName() or "").lower()
+            name = str(getattr(child, "name", "") or "").strip()
+        except Exception:
+            continue
+        if role not in {"frame", "window", "dialog"} and not name:
+            continue
+        title = name or app_name
+        key = (title, app_name, app_pid)
+        if key in seen:
+            continue
+        seen.add(key)
+        windows.append({"index": len(windows) + 1, "title": title, "wm_class": app_name, "pid": app_pid})
+        found = True
+    if not found and len(windows) < limit:
+        key = (app_name, app_name, app_pid)
+        if key not in seen:
+            seen.add(key)
+            windows.append({"index": len(windows) + 1, "title": app_name, "wm_class": app_name, "pid": app_pid})
+print(json.dumps(windows))
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(int(limit))],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+            check=False,
+        )
+    except Exception as exc:
+        log_routing(f"atspi: window list child failed ({exc})")
+        return []
+    if result.returncode != 0:
+        log_routing(f"atspi: window list child failed rc={result.returncode} stderr={result.stderr.strip()!r}")
+        return []
+    try:
+        parsed = json.loads(result.stdout)
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def format_window_list_for_speech(windows: list[dict[str, Any]]) -> str:
+    if not windows:
+        return "I cannot read the open windows right now."
+    names: list[str] = []
+    for item in windows:
+        title = str(item.get("title", "")).strip()
+        wm_class = str(item.get("wm_class", "")).strip()
+        label = title or wm_class
+        if wm_class and wm_class.lower() not in label.lower():
+            label = f"{wm_class}: {label}"
+        if label:
+            names.append(label[:80])
+    if not names:
+        return "I cannot read the open windows right now."
+    return "Open windows are: " + "; ".join(names)
+
+
 def copy_to_clipboard(text: str) -> bool:
     ok, _ = _offer_clipboard_text(text, paste_once=False)
     return ok
@@ -848,16 +1393,134 @@ def paste_text_via_clipboard(text: str, restore_clipboard: bool, target: FocusTa
     return True
 
 
+class SentenceSpeaker:
+    """Speaks queued sentences with the bundled piper TTS in a background
+    worker so streamed answers play while the model is still generating.
+    Synthesis of one sentence is ~0.03x realtime; nothing blocks the GUI."""
+
+    def __init__(self, config: ConfigManager) -> None:
+        self.config = config
+        self._queue: "queue.Queue[str | None]" = queue.Queue()
+        self._player: subprocess.Popen[bytes] | None = None
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._busy = False
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def is_busy(self) -> bool:
+        return self._busy or not self._queue.empty()
+
+    def _piper_binary(self) -> Path | None:
+        candidates = [
+            Path(__file__).resolve().parent / "piper_runtime" / "piper" / "piper",
+            Path(__file__).resolve().parent / "piper" / "piper",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        found = shutil.which("piper")
+        return Path(found) if found else None
+
+    def _voice_model(self) -> Path | None:
+        configured = str(self.config.get("answer_voice_model", "")).strip()
+        if configured:
+            path = Path(os.path.expanduser(configured))
+            if path.exists():
+                return path
+        # Reuse the reading app's chosen voice when available.
+        try:
+            reading_config = json.loads((CONFIG_DIR / "reading_config.json").read_text(encoding="utf-8"))
+            path = Path(os.path.expanduser(str(reading_config.get("piper_model", ""))))
+            if path.exists():
+                return path
+        except Exception:
+            pass
+        voices_root = Path(__file__).resolve().parent / "piper_voices"
+        for preferred in ("jenny_dioco", "cori", "alba"):
+            for candidate in voices_root.rglob(f"*{preferred}*.onnx"):
+                return candidate
+        return None
+
+    def available(self) -> bool:
+        return self._piper_binary() is not None and self._voice_model() is not None
+
+    def speak(self, sentence: str) -> None:
+        sentence = sentence.strip()
+        if sentence:
+            self._queue.put(sentence)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._generation += 1
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            if self._player is not None and self._player.poll() is None:
+                try:
+                    self._player.terminate()
+                except Exception:
+                    pass
+            self._player = None
+
+    def _worker(self) -> None:
+        while True:
+            sentence = self._queue.get()
+            if sentence is None:
+                continue
+            self._busy = True
+            with self._lock:
+                generation = self._generation
+            piper = self._piper_binary()
+            model = self._voice_model()
+            if piper is None or model is None:
+                continue
+            wav_path = STATE_DIR / "answer_tts.wav"
+            try:
+                synth = subprocess.run(
+                    [str(piper), "--model", str(model), "--output_file", str(wav_path)],
+                    input=sentence,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                if synth.returncode != 0 or not wav_path.exists():
+                    continue
+                with self._lock:
+                    if generation != self._generation:
+                        continue
+                    player_cmd = next(
+                        ([cmd, str(wav_path)] for cmd in ("pw-play", "paplay", "aplay") if shutil.which(cmd)),
+                        None,
+                    )
+                    if player_cmd is None:
+                        continue
+                    self._player = subprocess.Popen(
+                        player_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                    player = self._player
+                player.wait()
+            except Exception:
+                pass
+            finally:
+                self._busy = False
+
+
 class RecorderController:
     def __init__(
         self,
         config: ConfigManager,
         on_state_change: Callable[[bool, str], None] | None = None,
         on_transcript: Callable[[str, str], None] | None = None,
+        on_audio_quality: Callable[[str, str], None] | None = None,
     ) -> None:
         self.config = config
         self.on_state_change = on_state_change
         self.on_transcript = on_transcript
+        self.on_audio_quality = on_audio_quality
+        self.speaker = SentenceSpeaker(config)
 
         self._lock = threading.Lock()
         self._recording = False
@@ -872,6 +1535,17 @@ class RecorderController:
         self._last_known_focus_target: FocusTarget | None = None
         self._last_known_focus_at = 0.0
         self._last_transcript: str = ""
+        self._recording_mode = "single"
+        self._stop_recording_event: threading.Event | None = None
+        self._chunk_queue: "queue.Queue[tuple[int, Path] | None] | None" = None
+        self._transcriber_lock = threading.Lock()
+        self._gemma_pipe: Any | None = None
+        self._gemma_model: Any | None = None
+        self._gemma_processor: Any | None = None
+        self._gemma_loaded_ref = ""
+        self._assistant_awake_until = 0.0
+        self._assistant_awaiting_target = False
+        self._assistant_pending_transcript = ""
 
         if pyatspi is not None:
             threading.Thread(target=self._focus_tracker_loop, daemon=True).start()
@@ -994,6 +1668,338 @@ class RecorderController:
             return True, "Copied to clipboard (ydotool unavailable)"
         return False, "Could not type or copy transcript"
 
+    def _engine(self) -> str:
+        return self.config.transcription_engine()
+
+    def _should_use_chunked_recording(self) -> bool:
+        # Gemma 4 accepts at most 30 seconds of audio per prompt, so it always
+        # uses segmented capture. Whisper can opt in for live partial routing.
+        return self._engine() in {"gemma4-transformers", "ollama"} or bool(
+            self.config.get("streaming_transcription", False)
+        )
+
+    def _configured_max_seconds(self) -> int:
+        try:
+            return int(self.config.get("recording_max_seconds", 180))
+        except Exception:
+            return 180
+
+    def _chunk_seconds(self) -> float:
+        try:
+            seconds = float(self.config.get("streaming_chunk_seconds", 28))
+        except Exception:
+            seconds = 28.0
+        seconds = max(1.0, seconds)
+        if self._engine() in {"gemma4-transformers", "ollama"}:
+            seconds = min(seconds, float(GEMMA4_MAX_AUDIO_SECONDS))
+        return seconds
+
+    def _transcriber_preflight_error(self) -> str | None:
+        engine = self._engine()
+        if engine == "ollama":
+            model_name = self.config.ollama_model()
+            if not model_name:
+                return "Ollama model is not configured"
+            names = list_ollama_models(self.config.ollama_url())
+            if not names:
+                return "Ollama is not reachable (is `ollama serve` running?)"
+            if model_name not in names:
+                return f"Ollama model not found: {model_name}"
+            return None
+
+        if engine == "gemma4-transformers":
+            missing = [
+                package
+                for package in ("transformers", "accelerate", "soundfile")
+                if importlib.util.find_spec(package) is None
+            ]
+            if missing:
+                return "Gemma 4 backend missing Python packages: " + ", ".join(missing)
+            model_ref = self.config.gemma_model_ref()
+            if model_ref.startswith("/") or model_ref.startswith("~"):
+                model_path = Path(os.path.expanduser(model_ref))
+                if not model_path.exists():
+                    return f"Gemma model path not found: {model_path}"
+            return None
+
+        whisper_cli = self.config.whisper_cli_path()
+        if not whisper_cli.exists():
+            return f"whisper-cli not found: {whisper_cli}"
+        model_path = self.config.model_path()
+        if not model_path.exists():
+            return f"Model not found: {model_path}"
+        return None
+
+    def _report_audio_quality(self, audio_path: Path) -> str:
+        verdict, detail = analyze_audio_quality(audio_path)
+        if not verdict:
+            return ""
+        label = AUDIO_QUALITY_LABELS.get(verdict, verdict)
+        if self.on_audio_quality is not None:
+            try:
+                self.on_audio_quality(verdict, f"{label} ({detail})")
+            except Exception:
+                pass
+        if verdict not in ("good",):
+            log_routing(f"audio_quality: {verdict} {detail} file={audio_path.name}")
+        return label
+
+    def recordings_dir(self) -> Path:
+        return Path(
+            os.path.expanduser(str(self.config.get("recordings_dir", "~/.local/share/voice-typing/recordings")))
+        )
+
+    def last_recording_path(self) -> Path | None:
+        try:
+            wavs = sorted(self.recordings_dir().glob("*.wav"))
+        except Exception:
+            return None
+        return wavs[-1] if wavs else None
+
+    def archive_recording(self, sources: list[Path]) -> Path | None:
+        """Copy (or concatenate) captured audio into the recordings archive so
+        a failed or interrupted transcription never loses speech."""
+        if not bool(self.config.get("save_recordings", True)):
+            return None
+        sources = [p for p in sources if p.exists() and p.stat().st_size > 0]
+        if not sources:
+            return None
+        try:
+            dest_dir = self.recordings_dir()
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / time.strftime("recording_%Y%m%d_%H%M%S.wav")
+            if len(sources) == 1:
+                shutil.copy2(sources[0], dest)
+            else:
+                result = subprocess.run(
+                    ["sox"] + [str(p) for p in sources] + [str(dest)],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    # Concatenation failed; keep the chunks individually.
+                    for index, source in enumerate(sources):
+                        shutil.copy2(source, dest_dir / f"{dest.stem}_part{index:03d}.wav")
+                    dest = dest_dir / f"{dest.stem}_part000.wav"
+            self._prune_recordings(dest_dir)
+            log_routing(f"archive_recording: saved {dest}")
+            return dest
+        except Exception as exc:
+            log_routing(f"archive_recording failed: {exc}")
+            return None
+
+    def _prune_recordings(self, dest_dir: Path) -> None:
+        try:
+            keep = int(self.config.get("recordings_keep", 30))
+        except Exception:
+            keep = 30
+        if keep <= 0:
+            return
+        try:
+            wavs = sorted(dest_dir.glob("*.wav"))
+            for old in wavs[:-keep]:
+                old.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def retranscribe_path_async(self, audio_path: Path | None = None) -> tuple[bool, str]:
+        """Re-run transcription on an archived recording (newest by default).
+        Result goes to the GUI transcript box and the clipboard; it is never
+        auto-typed because the original focus context is long gone."""
+        if audio_path is None:
+            audio_path = self.last_recording_path()
+        if audio_path is None or not audio_path.exists():
+            return False, "No saved recordings found"
+        with self._lock:
+            if self._recording:
+                return False, "Recording in progress"
+            if self._transcribing:
+                return False, "Transcribing previous recording"
+            self._transcribing = True
+
+        def _work() -> None:
+            try:
+                notify("Voice typing", f"Re-transcribing {audio_path.name}...")
+                text, err = self._transcribe_audio_path(audio_path)
+                if err:
+                    notify("Voice typing", err, urgency="critical")
+                    return
+                transcript = text.strip()
+                if not transcript:
+                    notify("Voice typing", "Transcript is empty")
+                    self._emit_transcript("", "empty")
+                    return
+                with self._lock:
+                    self._last_transcript = transcript
+                self._emit_transcript(transcript, "recognized")
+                copied = copy_to_clipboard(transcript)
+                self._emit_transcript(transcript, "clipboard" if copied else "gui_only")
+                notify(
+                    "Voice typing",
+                    "Re-transcribed and copied to clipboard" if copied else "Re-transcribed (see GUI)",
+                )
+            finally:
+                with self._lock:
+                    self._transcribing = False
+
+        threading.Thread(target=_work, daemon=True).start()
+        return True, f"Re-transcribing {audio_path.name}"
+
+    def ask_ollama(self, question: str) -> tuple[str, str | None]:
+        """Send a text question to the local Ollama model and return a
+        plain-text answer (used by ask-gemma mode and the `ask` CLI)."""
+        question = question.strip()
+        if not question:
+            return "", "Empty question"
+        payload = {
+            "model": self.config.ollama_model(),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": str(
+                        self.config.get("ollama_ask_system_prompt", DEFAULT_CONFIG["ollama_ask_system_prompt"])
+                    ),
+                },
+                {"role": "user", "content": question},
+            ],
+            "stream": False,
+            "temperature": 0.3,
+            "max_tokens": int(self.config.get("ollama_answer_max_tokens", 600)),
+        }
+        if bool(self.config.get("ollama_disable_thinking", True)):
+            payload["reasoning_effort"] = "none"
+        timeout_sec = int(self.config.get("ollama_timeout_seconds", 120))
+        try:
+            req = urllib.request.Request(
+                f"{self.config.ollama_url()}/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                body = str(exc)
+            return "", f"Ollama answer failed: {body or exc}"
+        except Exception as exc:
+            return "", f"Ollama answer failed: {exc}"
+        try:
+            content = data.get("choices", [])[0].get("message", {}).get("content", "")
+        except Exception:
+            content = ""
+        answer = str(content).strip()
+        if not answer:
+            return "", "Ollama returned an empty answer"
+        return answer, None
+
+    def ask_ollama_stream(self, question: str, on_sentence: Callable[[str], None]) -> tuple[str, str | None]:
+        """Like ask_ollama, but streams tokens and emits complete sentences
+        through on_sentence as they form, so TTS can start speaking while the
+        model is still generating."""
+        question = question.strip()
+        if not question:
+            return "", "Empty question"
+        payload = {
+            "model": self.config.ollama_model(),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": str(
+                        self.config.get("ollama_ask_system_prompt", DEFAULT_CONFIG["ollama_ask_system_prompt"])
+                    ),
+                },
+                {"role": "user", "content": question},
+            ],
+            "stream": True,
+            "temperature": 0.3,
+            "max_tokens": int(self.config.get("ollama_answer_max_tokens", 600)),
+        }
+        if bool(self.config.get("ollama_disable_thinking", True)):
+            payload["reasoning_effort"] = "none"
+        timeout_sec = int(self.config.get("ollama_timeout_seconds", 120))
+
+        sentence_end = re.compile(r"(?<=[.!?:;])\s+")
+        full: list[str] = []
+        buffer = ""
+
+        def _flush(force: bool = False) -> None:
+            nonlocal buffer
+            while True:
+                match = sentence_end.search(buffer)
+                if match:
+                    sentence, buffer = buffer[: match.start()], buffer[match.end() :]
+                    if sentence.strip():
+                        on_sentence(sentence.strip())
+                    continue
+                break
+            if force and buffer.strip():
+                on_sentence(buffer.strip())
+                buffer = ""
+
+        try:
+            req = urllib.request.Request(
+                f"{self.config.ollama_url()}/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_part = line[5:].strip()
+                    if data_part == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_part)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        token = str(delta.get("content") or "")
+                    except Exception:
+                        continue
+                    if token:
+                        full.append(token)
+                        buffer += token
+                        _flush()
+        except Exception as exc:
+            if not full:
+                return "", f"Ollama answer failed: {exc}"
+        _flush(force=True)
+        answer = "".join(full).strip()
+        if not answer:
+            return "", "Ollama returned an empty answer"
+        return answer, None
+
+    def warm_up_transcriber_async(self) -> None:
+        """Ask Ollama to load the model now so the first chunk does not pay
+        the multi-second cold-load penalty. No-op when Ollama is unused."""
+        if self._engine() != "ollama" and not bool(self.config.get("assistant_answer_mode", False)):
+            return
+        model_name = self.config.ollama_model()
+        if not model_name:
+            return
+
+        def _ping() -> None:
+            payload = {
+                "model": model_name,
+                "keep_alive": str(self.config.get("ollama_keep_alive", "30m")),
+            }
+            try:
+                req = urllib.request.Request(
+                    f"{self.config.ollama_url()}/api/generate",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=120):
+                    pass
+            except Exception:
+                pass
+
+        threading.Thread(target=_ping, daemon=True).start()
+
     def start_recording(
         self,
         capture_focus: bool,
@@ -1024,37 +2030,66 @@ class RecorderController:
                 return False, "Transcribing previous recording"
 
             STATE_DIR.mkdir(parents=True, exist_ok=True)
+            CHUNK_DIR.mkdir(parents=True, exist_ok=True)
             if AUDIO_PATH.exists():
                 AUDIO_PATH.unlink(missing_ok=True)
 
-            max_seconds = int(self.config.get("recording_max_seconds", 180))
-            sox_cmd = [
-                "sox",
-                "-q",
-                "-d",
-                "-r",
-                "16000",
-                "-c",
-                "1",
-                "-b",
-                "16",
-                str(AUDIO_PATH),
-                "trim",
-                "0",
-                str(max_seconds),
-            ]
-
-            try:
-                self._process = subprocess.Popen(
-                    sox_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-            except FileNotFoundError:
+            if shutil.which("sox") is None:
                 return False, "SoX is not installed or not in PATH"
-            except Exception as exc:
-                return False, f"Failed to start recording: {exc}"
+
+            preflight_error = self._transcriber_preflight_error()
+            if preflight_error:
+                return False, preflight_error
+
+            # A new take should not compete with a spoken answer (and the mic
+            # must not pick the TTS voice up).
+            self.speaker.stop()
+
+            # Load the Ollama model while audio is still being captured.
+            self.warm_up_transcriber_async()
+
+            self._recording_mode = "chunked" if self._should_use_chunked_recording() else "single"
+            self._stop_recording_event = None
+            self._chunk_queue = None
+            self._last_transcript = ""
+            input_args, input_env = sox_input_args(self.config)
+
+            if self._recording_mode == "single":
+                sox_cmd = [
+                    "sox",
+                    "-q",
+                    *input_args,
+                    "-r",
+                    "16000",
+                    "-c",
+                    "1",
+                    "-b",
+                    "16",
+                    str(AUDIO_PATH),
+                ]
+                max_seconds = self._configured_max_seconds()
+                if max_seconds > 0:
+                    sox_cmd.extend(["trim", "0", str(max_seconds)])
+
+                try:
+                    self._process = subprocess.Popen(
+                        sox_cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=input_env,
+                    )
+                except Exception as exc:
+                    return False, f"Failed to start recording: {exc}"
+            else:
+                for old_chunk in CHUNK_DIR.glob("chunk_*.wav"):
+                    try:
+                        old_chunk.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                self._process = None
+                self._stop_recording_event = threading.Event()
+                self._chunk_queue = queue.Queue()
 
             self._recording = True
             self._started_at = time.time()
@@ -1106,18 +2141,29 @@ class RecorderController:
         notify("Voice typing", "Recording started")
         self._emit_state(True, "recording")
         threading.Thread(target=self._watch_limit_warning, daemon=True).start()
-        threading.Thread(target=self._watch_sox_process, daemon=True).start()
+        if self._recording_mode == "chunked":
+            threading.Thread(target=self._record_chunk_loop, daemon=True).start()
+            threading.Thread(target=self._chunk_transcribe_loop, daemon=True).start()
+        else:
+            threading.Thread(target=self._watch_sox_process, daemon=True).start()
         return True, "Recording started"
 
     def stop_recording(self, reason: str = "manual_stop") -> tuple[bool, str]:
         process: subprocess.Popen[str] | None
+        stop_event: threading.Event | None
+        mode: str
         with self._lock:
             if not self._recording:
                 return False, "Not recording"
             self._recording = False
             self._transcribing = True
+            mode = self._recording_mode
+            stop_event = self._stop_recording_event
             process = self._process
             self._process = None
+
+        if stop_event is not None:
+            stop_event.set()
 
         if process is not None:
             try:
@@ -1130,17 +2176,26 @@ class RecorderController:
                     pass
 
         self._emit_state(False, reason)
+        if mode == "chunked":
+            return True, "Stopping and transcribing remaining audio"
         return self._finish_transcription(reason)
 
     def stop_recording_async(self, reason: str = "manual_stop") -> tuple[bool, str]:
         process: subprocess.Popen[str] | None
+        stop_event: threading.Event | None
+        mode: str
         with self._lock:
             if not self._recording:
                 return False, "Not recording"
             self._recording = False
             self._transcribing = True
+            mode = self._recording_mode
+            stop_event = self._stop_recording_event
             process = self._process
             self._process = None
+
+        if stop_event is not None:
+            stop_event.set()
 
         if process is not None:
             try:
@@ -1153,7 +2208,8 @@ class RecorderController:
                     pass
 
         self._emit_state(False, reason)
-        threading.Thread(target=self._finish_transcription, args=(reason,), daemon=True).start()
+        if mode != "chunked":
+            threading.Thread(target=self._finish_transcription, args=(reason,), daemon=True).start()
         return True, "Stopping and transcribing"
 
     def toggle_recording(
@@ -1211,9 +2267,9 @@ class RecorderController:
 
     def _watch_limit_warning(self) -> None:
         warn_before = int(self.config.get("recording_warn_before_seconds", 15))
-        max_seconds = int(self.config.get("recording_max_seconds", 180))
+        max_seconds = self._configured_max_seconds()
 
-        if warn_before <= 0 or warn_before >= max_seconds:
+        if max_seconds <= 0 or warn_before <= 0 or warn_before >= max_seconds:
             return
 
         time.sleep(max_seconds - warn_before)
@@ -1245,31 +2301,408 @@ class RecorderController:
         self._emit_state(False, "limit_or_error")
         self._finish_transcription("limit_reached")
 
+    def _record_chunk_loop(self) -> None:
+        queue_ref = self._chunk_queue
+        stop_event = self._stop_recording_event
+        if queue_ref is None or stop_event is None:
+            return
+
+        started_at = time.time()
+        seq = 0
+        limit_reached = False
+
+        try:
+            while not stop_event.is_set():
+                max_seconds = self._configured_max_seconds()
+                elapsed = time.time() - started_at
+                if max_seconds > 0 and elapsed >= max_seconds:
+                    limit_reached = True
+                    break
+
+                duration = self._chunk_seconds()
+                if max_seconds > 0:
+                    duration = max(0.5, min(duration, max_seconds - elapsed))
+
+                chunk_path = CHUNK_DIR / f"chunk_{int(started_at)}_{seq:04d}.wav"
+                chunk_path.unlink(missing_ok=True)
+                input_args, input_env = sox_input_args(self.config)
+                cmd = [
+                    "sox",
+                    "-q",
+                    *input_args,
+                    "-r",
+                    "16000",
+                    "-c",
+                    "1",
+                    "-b",
+                    "16",
+                    str(chunk_path),
+                    "trim",
+                    "0",
+                    f"{duration:.3f}",
+                ]
+                try:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=input_env,
+                    )
+                except Exception as exc:
+                    log_routing(f"chunk_record: failed to start sox ({exc})")
+                    notify("Voice typing", f"Failed to start audio chunk: {exc}", urgency="critical")
+                    break
+
+                with self._lock:
+                    if not self._recording:
+                        stop_event.set()
+                    else:
+                        self._process = process
+
+                if stop_event.is_set():
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+
+                rc = process.wait()
+
+                with self._lock:
+                    if self._process is process:
+                        self._process = None
+                    still_recording = self._recording
+
+                try:
+                    if chunk_path.exists() and chunk_path.stat().st_size > 0:
+                        queue_ref.put((seq, chunk_path))
+                except Exception:
+                    pass
+
+                if not still_recording or stop_event.is_set():
+                    break
+                if rc != 0:
+                    stderr = ""
+                    try:
+                        stderr = (process.stderr.read() if process.stderr else "") or ""
+                    except Exception:
+                        stderr = ""
+                    log_routing(f"chunk_record: sox exited rc={rc} stderr={stderr.strip()!r}")
+                    break
+
+                seq += 1
+
+            if limit_reached:
+                with self._lock:
+                    if self._recording:
+                        self._recording = False
+                        self._transcribing = True
+                self._emit_state(False, "limit_or_error")
+        finally:
+            queue_ref.put(None)
+
+    def _chunk_transcribe_loop(self) -> None:
+        queue_ref = self._chunk_queue
+        if queue_ref is None:
+            return
+
+        saw_transcript = False
+        last_error = ""
+        route_partials = bool(self.config.get("streaming_route_partials", True))
+
+        while True:
+            item = queue_ref.get()
+            if item is None:
+                break
+            seq, audio_path = item
+            # Live mic feedback while still talking (sox stats; milliseconds).
+            if self._report_audio_quality(audio_path) == AUDIO_QUALITY_LABELS["silent"]:
+                continue
+            text, err = self._transcribe_audio_path(audio_path)
+            if err:
+                last_error = err
+                log_routing(f"chunk_transcribe: chunk={seq} error={err!r}")
+                notify("Voice typing", err, urgency="critical")
+                continue
+            transcript = text.strip()
+            if not transcript:
+                continue
+            if self._handle_voice_command(transcript):
+                continue
+            prepared = self._prepare_assistant_transcript(transcript)
+            if not prepared:
+                continue
+            if self._handle_voice_command(prepared):
+                continue
+            saw_transcript = True
+            full_transcript = self._append_last_transcript(prepared)
+            self._emit_transcript(full_transcript, "recognized")
+            if route_partials:
+                route = self._route_or_hold_transcript(prepared)
+                if route is not None:
+                    self._emit_transcript(full_transcript, route)
+
+        final_transcript = self.last_transcript().strip()
+        if final_transcript and not route_partials:
+            route = self._route_or_hold_transcript(final_transcript)
+            if route is not None:
+                self._emit_transcript(final_transcript, route)
+
+        # Keep the full session audio so a bad chunk transcription can be
+        # retried later against the whole recording.
+        self.archive_recording(sorted(CHUNK_DIR.glob("chunk_*.wav")))
+
+        with self._lock:
+            self._transcribing = False
+
+        if saw_transcript:
+            notify("Voice typing", "Streaming transcript ready")
+        elif last_error:
+            notify("Voice typing", last_error, urgency="critical")
+        else:
+            notify("Voice typing", "Transcript is empty")
+            self._emit_transcript("", "empty")
+
+    def _append_last_transcript(self, transcript: str) -> str:
+        transcript = transcript.strip()
+        with self._lock:
+            if self._last_transcript:
+                self._last_transcript = f"{self._last_transcript.rstrip()} {transcript}"
+            else:
+                self._last_transcript = transcript
+            return self._last_transcript
+
+    def _assistant_wake_phrases(self) -> list[str]:
+        raw = self.config.get("assistant_wake_phrases", ["hey antonio", "good morning antonio"])
+        phrases = [str(item) for item in raw] if isinstance(raw, list) else ["hey antonio"]
+        return [phrase for phrase in phrases if phrase.strip()]
+
+    def _assistant_prompts_enabled(self) -> bool:
+        return bool(self.config.get("voice_prompts_enabled", False))
+
+    def _assistant_wake_mode_enabled(self) -> bool:
+        return bool(self.config.get("assistant_wake_mode", False))
+
+    def _prepare_assistant_transcript(self, transcript: str) -> str | None:
+        if not self._assistant_wake_mode_enabled():
+            return transcript.strip()
+
+        woke, remainder = strip_leading_phrase(transcript, self._assistant_wake_phrases())
+        now = time.time()
+        if woke:
+            awake_seconds = float(self.config.get("assistant_awake_seconds", 20))
+            self._assistant_awake_until = now + max(3.0, awake_seconds)
+            if not remainder:
+                self._prompt_for_write_target(include_windows=not self._has_write_target())
+                return None
+            return remainder.strip()
+
+        if now > self._assistant_awake_until:
+            log_routing(f"assistant: ignored transcript while asleep: {transcript[:120]!r}")
+            return None
+        return transcript.strip()
+
+    def _has_write_target(self) -> bool:
+        candidates = [
+            self._focus_target,
+            self._focus_target_at_start,
+            self._recent_focus_target(max_age_seconds=20.0),
+        ]
+        for candidate in candidates:
+            if candidate is not None and candidate.source_pid != os.getpid() and has_focus_target_identity(candidate):
+                return True
+
+        candidate = capture_focus_target_for_hotkey(retries=2, delay_s=0.02)
+        if candidate is None or candidate.source_pid == os.getpid():
+            return False
+        self._remember_focus_target(candidate)
+        self._focus_target = candidate
+        self._focus_target_at_start = candidate
+        return True
+
+    def _prompt_for_write_target(self, include_windows: bool = True) -> None:
+        self._assistant_awaiting_target = True
+        prompt = "Where should I write?"
+        if include_windows:
+            window_text = format_window_list_for_speech(list_open_windows())
+            prompt = f"{prompt} {window_text}"
+        notify("Voice typing", prompt)
+        speak_prompt(prompt, self._assistant_prompts_enabled())
+        self._emit_transcript("", "awaiting_target")
+
+    def _route_or_hold_transcript(self, text: str) -> str | None:
+        if (
+            self._assistant_wake_mode_enabled()
+            and bool(self.config.get("assistant_ask_target_when_uncertain", True))
+            and not self._has_write_target()
+        ):
+            self._assistant_pending_transcript = text.strip()
+            self._prompt_for_write_target(include_windows=True)
+            log_routing("assistant: held transcript while waiting for target window")
+            return "awaiting_target"
+        return self._route_transcript(text)
+
+    def _focus_window_and_flush_pending(self, query: str) -> bool:
+        ok = activate_window_by_query(query)
+        if not ok:
+            return False
+
+        time.sleep(0.20)
+        candidate = capture_focus_target_for_hotkey(retries=8, delay_s=0.04)
+        if candidate is not None and candidate.source_pid != os.getpid():
+            self._remember_focus_target(candidate)
+            self._focus_target = candidate
+            self._focus_target_at_start = candidate
+
+        self._assistant_awaiting_target = False
+        pending = self._assistant_pending_transcript.strip()
+        self._assistant_pending_transcript = ""
+        if pending:
+            route = self._route_transcript(pending)
+            self._emit_transcript(self.last_transcript() or pending, route)
+        return True
+
+    def _handle_voice_command(self, transcript: str) -> bool:
+        if not bool(self.config.get("voice_commands_enabled", True)):
+            return False
+        raw_prefixes = self.config.get("voice_command_prefixes", ["voice typing", "computer"])
+        prefixes = [str(item) for item in raw_prefixes] if isinstance(raw_prefixes, list) else ["voice typing"]
+        for phrase in self._assistant_wake_phrases():
+            if phrase not in prefixes:
+                prefixes.append(phrase)
+        parsed = parse_voice_command(transcript, prefixes)
+        if parsed is None:
+            if self._assistant_awaiting_target and self._focus_window_and_flush_pending(transcript):
+                notify("Voice typing", f"Focused {transcript}")
+                return True
+            return False
+
+        command, argument = parsed
+        log_routing(f"voice_command: {command} arg={argument!r}")
+
+        if command == "status":
+            woke, _ = strip_leading_phrase(transcript, self._assistant_wake_phrases())
+            if woke:
+                awake_seconds = float(self.config.get("assistant_awake_seconds", 20))
+                self._assistant_awake_until = time.time() + max(3.0, awake_seconds)
+            if woke and self._assistant_wake_mode_enabled() and not self._has_write_target():
+                self._prompt_for_write_target(include_windows=True)
+            else:
+                notify("Voice typing", "Listening")
+                speak_prompt("Listening.", bool(self.config.get("voice_prompts_enabled", False)))
+            return True
+        if command == "prompt_target":
+            self._prompt_for_write_target(include_windows=True)
+            return True
+        if command == "list_windows":
+            window_text = format_window_list_for_speech(list_open_windows())
+            notify("Voice typing", window_text)
+            speak_prompt(window_text, self._assistant_prompts_enabled())
+            return True
+        if command == "dictate":
+            text = argument.strip()
+            if text:
+                full_transcript = self._append_last_transcript(text)
+                self._emit_transcript(full_transcript, "recognized")
+                route = self._route_or_hold_transcript(text)
+                if route is not None:
+                    self._emit_transcript(full_transcript, route)
+            return True
+        if command == "stop_listening":
+            self.stop_recording_async(reason="voice_command_stop")
+            notify("Voice typing", "Stopping by voice command")
+            return True
+        if command == "cancel":
+            with self._lock:
+                self._last_transcript = ""
+            self._assistant_pending_transcript = ""
+            self._assistant_awaiting_target = False
+            notify("Voice typing", "Dictation discarded")
+            self._emit_transcript("", "empty")
+            return True
+        if command == "paste_last":
+            ok, message = self.paste_last_transcript()
+            notify("Voice typing", message, urgency="normal" if ok else "critical")
+            return True
+        if command == "copy_last":
+            text = self.last_transcript().strip()
+            if text and copy_to_clipboard(text):
+                notify("Voice typing", "Last transcript copied to clipboard")
+            else:
+                notify("Voice typing", "No transcript available", urgency="critical")
+            return True
+        if command == "focus_original":
+            ok = self.restore_original_focus_target(max_age_seconds=20.0)
+            notify("Voice typing", "Focus restored" if ok else "Could not restore focus")
+            return True
+        if command == "focus_window":
+            ok = self._focus_window_and_flush_pending(argument)
+            if ok:
+                notify("Voice typing", f"Focused {argument}")
+            else:
+                notify("Voice typing", f"No window matched {argument}", urgency="critical")
+                speak_prompt(
+                    f"I could not find a window matching {argument}.",
+                    bool(self.config.get("voice_prompts_enabled", False)),
+                )
+            return True
+        return False
+
     def _finish_transcription(self, reason: str) -> tuple[bool, str]:
         try:
             if not AUDIO_PATH.exists() or AUDIO_PATH.stat().st_size == 0:
                 notify("Voice typing", "No audio captured")
                 return False, "No audio captured"
 
+            # Archive first: whatever happens next, the speech is safe.
+            archived = self.archive_recording([AUDIO_PATH])
+            saved_hint = f" Audio saved as {archived.name}; use Retry Last Audio." if archived else ""
+            quality_label = self._report_audio_quality(AUDIO_PATH)
+            quality_hint = f" ({quality_label})" if quality_label and quality_label != "Mic OK" else ""
+            if quality_label == AUDIO_QUALITY_LABELS["silent"]:
+                message = "No signal from selected microphone"
+                notify("Voice typing", message + saved_hint + quality_hint, urgency="critical")
+                self._emit_transcript("", "empty")
+                return False, message
+
             notify("Voice typing", "Transcribing...")
-            text, err = self._transcribe_audio()
+            text, err = self._transcribe_audio_path(AUDIO_PATH)
             if err:
-                notify("Voice typing", err, urgency="critical")
+                notify("Voice typing", err + saved_hint + quality_hint, urgency="critical")
                 return False, err
 
             transcript = text.strip()
             if not transcript:
-                notify("Voice typing", "Transcript is empty")
+                notify("Voice typing", "Transcript is empty" + saved_hint + quality_hint)
                 self._emit_transcript("", "empty")
                 return False, "Transcript is empty"
+
+            display_text = transcript
+            if bool(self.config.get("assistant_answer_mode", False)):
+                # Ask-gemma mode: the transcript is a question; route the
+                # model's answer instead of the transcript itself.
+                self._emit_transcript(f"Q: {transcript}", "recognized")
+                notify("Voice typing", "Asking Gemma...")
+                speak_aloud = bool(self.config.get("answer_speak_aloud", True)) and self.speaker.available()
+                if speak_aloud:
+                    self.speaker.stop()  # silence any previous answer
+                    answer, ask_err = self.ask_ollama_stream(transcript, self.speaker.speak)
+                else:
+                    answer, ask_err = self.ask_ollama(transcript)
+                if ask_err:
+                    # Never lose the question: fall back to routing it as text.
+                    notify("Voice typing", f"{ask_err}. Routing the question text instead.", urgency="critical")
+                else:
+                    transcript = answer
+                    display_text = f"Q: {display_text}\n\nA: {answer}"
 
             # Store transcript so it can be pasted later via the paste-last hotkey.
             self._last_transcript = transcript
 
             # Surface transcript to UI immediately, even if insertion/clipboard routing fails.
-            self._emit_transcript(transcript, "recognized")
+            self._emit_transcript(display_text, "recognized")
             route = self._route_transcript(transcript)
-            self._emit_transcript(transcript, route)
+            self._emit_transcript(display_text, route)
 
             if self._capture_focus and not self._started_from_gui:
                 # Keep keyboard focus on original target so user can continue typing.
@@ -1305,7 +2738,15 @@ class RecorderController:
             with self._lock:
                 self._transcribing = False
 
-    def _transcribe_audio(self) -> tuple[str, str | None]:
+    def _transcribe_audio_path(self, audio_path: Path) -> tuple[str, str | None]:
+        with self._transcriber_lock:
+            if self._engine() == "ollama":
+                return self._transcribe_audio_ollama(audio_path)
+            if self._engine() == "gemma4-transformers":
+                return self._transcribe_audio_gemma4(audio_path)
+            return self._transcribe_audio_whisper(audio_path)
+
+    def _transcribe_audio_whisper(self, audio_path: Path) -> tuple[str, str | None]:
         whisper_cli = self.config.whisper_cli_path()
         if not whisper_cli.exists():
             return "", f"whisper-cli not found: {whisper_cli}"
@@ -1314,7 +2755,7 @@ class RecorderController:
         if not model_path.exists():
             return "", f"Model not found: {model_path}"
 
-        out_prefix = TRANSCRIPT_PREFIX
+        out_prefix = TRANSCRIPT_PREFIX if audio_path == AUDIO_PATH else STATE_DIR / f"transcript_{audio_path.stem}"
         txt_path = Path(str(out_prefix) + ".txt")
         txt_path.unlink(missing_ok=True)
 
@@ -1323,7 +2764,7 @@ class RecorderController:
             "-m",
             str(model_path),
             "-f",
-            str(AUDIO_PATH),
+            str(audio_path),
             "-nt",
             "-of",
             str(out_prefix),
@@ -1333,7 +2774,10 @@ class RecorderController:
         if bool(self.config.get("no_gpu", True)):
             cmd.append("--no-gpu")
 
-        timeout_sec = int(self.config.get("transcribe_timeout_seconds", 90))
+        # A fixed timeout silently killed long recordings; scale with the
+        # audio length so a 30-minute take is allowed to finish.
+        base_timeout = int(self.config.get("transcribe_timeout_seconds", 90))
+        timeout_sec = max(base_timeout, int(audio_duration_seconds(audio_path) * 3) + 60)
 
         try:
             result = subprocess.run(
@@ -1361,6 +2805,297 @@ class RecorderController:
 
         stdout = (result.stdout or "").strip()
         return stdout, None
+
+    def _transcribe_audio_ollama(self, audio_path: Path) -> tuple[str, str | None]:
+        if not audio_path.exists() or audio_path.stat().st_size == 0:
+            return "", "No audio captured"
+
+        # Gemma audio prompts cap at 30s; past that the model degenerates into
+        # repetition loops. Live recording already chunks, but retranscribe
+        # sends whole archived files, so split long audio here.
+        duration = audio_duration_seconds(audio_path)
+        if duration > GEMMA4_MAX_AUDIO_SECONDS:
+            return self._transcribe_audio_ollama_segmented(audio_path, duration)
+
+        # Gemma's audio encoder is much weaker than Whisper on quiet input
+        # (a -36 dB RMS take that Whisper nails comes back as "unintelligible"),
+        # so peak-normalize a temp copy before sending.
+        send_path = audio_path
+        norm_path = STATE_DIR / f"ollama_norm_{audio_path.stem}.wav"
+        if bool(self.config.get("ollama_normalize_audio", True)):
+            try:
+                result = subprocess.run(
+                    ["sox", str(audio_path), str(norm_path), "norm", "-3"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                if result.returncode == 0 and norm_path.exists() and norm_path.stat().st_size > 0:
+                    send_path = norm_path
+            except Exception:
+                pass
+
+        try:
+            audio_b64 = base64.b64encode(send_path.read_bytes()).decode("ascii")
+        except Exception as exc:
+            return "", f"Failed reading audio for Ollama: {exc}"
+        finally:
+            # The base64 copy is in memory; the temp file is no longer needed.
+            norm_path.unlink(missing_ok=True)
+
+        prompt = str(self.config.get("ollama_transcribe_prompt", DEFAULT_CONFIG["ollama_transcribe_prompt"]))
+        payload = {
+            "model": self.config.ollama_model(),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": audio_b64, "format": "wav"},
+                        },
+                    ],
+                }
+            ],
+            "stream": False,
+            "temperature": 0,
+            # Dampens the repetition loops gemma4 falls into on hard audio.
+            "frequency_penalty": float(self.config.get("ollama_frequency_penalty", 0.5)),
+            "max_tokens": int(self.config.get("ollama_max_tokens", 512)),
+        }
+        if bool(self.config.get("ollama_disable_thinking", True)):
+            # gemma4 thinks by default; the chain-of-thought eats the whole
+            # token budget and "content" comes back empty. Verified fix.
+            payload["reasoning_effort"] = "none"
+        timeout_sec = int(self.config.get("ollama_timeout_seconds", 120))
+
+        try:
+            req = urllib.request.Request(
+                f"{self.config.ollama_url()}/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                raw = resp.read().decode("utf-8")
+            data = json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                body = str(exc)
+            return "", f"Ollama transcription failed: {body or exc}"
+        except Exception as exc:
+            return "", f"Ollama transcription failed: {exc}"
+
+        try:
+            choices = data.get("choices", [])
+            message = choices[0].get("message", {}) if choices else {}
+            content = message.get("content", "")
+        except Exception:
+            content = ""
+        return self._clean_gemma_text(str(content)), None
+
+    def _transcribe_audio_ollama_segmented(self, audio_path: Path, duration: float) -> tuple[str, str | None]:
+        segment_seconds = min(self._chunk_seconds(), float(GEMMA4_MAX_AUDIO_SECONDS))
+        segment_dir = STATE_DIR / "ollama_segments"
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        parts: list[str] = []
+        last_error: str | None = None
+        offset = 0.0
+        index = 0
+        while offset < duration:
+            segment_path = segment_dir / f"segment_{index:03d}.wav"
+            try:
+                result = subprocess.run(
+                    ["sox", str(audio_path), str(segment_path), "trim", str(offset), str(segment_seconds)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    return "", f"Failed splitting audio for Ollama: {(result.stderr or '').strip()}"
+                text, err = self._transcribe_audio_ollama(segment_path)
+            finally:
+                segment_path.unlink(missing_ok=True)
+            if err:
+                last_error = err
+            elif text.strip():
+                parts.append(text.strip())
+            offset += segment_seconds
+            index += 1
+        combined = " ".join(parts)
+        if combined:
+            return combined, None
+        return "", last_error
+
+    def _transcribe_audio_gemma4(self, audio_path: Path) -> tuple[str, str | None]:
+        if not audio_path.exists() or audio_path.stat().st_size == 0:
+            return "", "No audio captured"
+
+        try:
+            import transformers  # type: ignore
+        except Exception:
+            return (
+                "",
+                "Gemma 4 backend requires Python package 'transformers'. "
+                "Install torch, accelerate, transformers, and an audio decoder such as soundfile.",
+            )
+
+        backend = str(self.config.get("gemma_backend", "pipeline")).strip().lower()
+        try:
+            if backend == "objects":
+                return self._transcribe_audio_gemma4_objects(audio_path, transformers)
+            return self._transcribe_audio_gemma4_pipeline(audio_path, transformers)
+        except Exception as exc:
+            return "", f"Gemma 4 transcription failed: {exc}"
+
+    def _gemma_messages_for_audio(self, audio_path: Path) -> list[dict[str, Any]]:
+        prompt = str(self.config.get("gemma_transcribe_prompt", DEFAULT_CONFIG["gemma_transcribe_prompt"]))
+        # The current Transformers pipeline accepts local audio paths as strings.
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "audio", "audio": str(audio_path.resolve())},
+                ],
+            }
+        ]
+
+    def _gemma_generation_kwargs(self, transformers_module: Any) -> dict[str, Any]:
+        max_new_tokens = int(self.config.get("gemma_max_new_tokens", 192))
+        model_ref = self.config.gemma_model_ref()
+        try:
+            generation_config = transformers_module.GenerationConfig.from_pretrained(model_ref)
+            generation_config.max_new_tokens = max_new_tokens
+            return {"generation_config": generation_config}
+        except Exception:
+            return {"max_new_tokens": max_new_tokens}
+
+    def _transcribe_audio_gemma4_pipeline(
+        self,
+        audio_path: Path,
+        transformers_module: Any,
+    ) -> tuple[str, str | None]:
+        model_ref = self.config.gemma_model_ref()
+        if not model_ref:
+            return "", "Gemma model is not configured"
+
+        if self._gemma_pipe is None or self._gemma_loaded_ref != f"pipeline:{model_ref}":
+            dtype_value = str(self.config.get("gemma_dtype", "auto")).strip() or "auto"
+            device_map = str(self.config.get("gemma_device_map", "auto")).strip() or "auto"
+            try:
+                self._gemma_pipe = transformers_module.pipeline(
+                    task="any-to-any",
+                    model=model_ref,
+                    device_map=device_map,
+                    dtype=dtype_value,
+                )
+            except TypeError:
+                self._gemma_pipe = transformers_module.pipeline(
+                    task="any-to-any",
+                    model=model_ref,
+                    device_map=device_map,
+                    torch_dtype=dtype_value,
+                )
+            self._gemma_model = None
+            self._gemma_processor = None
+            self._gemma_loaded_ref = f"pipeline:{model_ref}"
+
+        messages = self._gemma_messages_for_audio(audio_path)
+        gen_kwargs = self._gemma_generation_kwargs(transformers_module)
+        try:
+            result = self._gemma_pipe(text=messages, return_full_text=False, generate_kwargs=gen_kwargs)
+        except TypeError:
+            result = self._gemma_pipe(messages, return_full_text=False, generate_kwargs=gen_kwargs)
+        return self._extract_gemma_text(result), None
+
+    def _transcribe_audio_gemma4_objects(
+        self,
+        audio_path: Path,
+        transformers_module: Any,
+    ) -> tuple[str, str | None]:
+        model_ref = self.config.gemma_model_ref()
+        if not model_ref:
+            return "", "Gemma model is not configured"
+
+        if self._gemma_model is None or self._gemma_processor is None or self._gemma_loaded_ref != f"objects:{model_ref}":
+            model_cls = getattr(transformers_module, "AutoModelForMultimodalLM", None)
+            if model_cls is None:
+                model_cls = getattr(transformers_module, "AutoModelForImageTextToText", None)
+            if model_cls is None:
+                return (
+                    "",
+                    "Installed transformers does not expose AutoModelForMultimodalLM "
+                    "or AutoModelForImageTextToText; use gemma_backend='pipeline' or upgrade transformers.",
+                )
+            dtype_value = str(self.config.get("gemma_dtype", "auto")).strip() or "auto"
+            device_map = str(self.config.get("gemma_device_map", "auto")).strip() or "auto"
+            processor_cls = getattr(transformers_module, "AutoProcessor")
+            try:
+                self._gemma_model = model_cls.from_pretrained(model_ref, dtype=dtype_value, device_map=device_map)
+            except TypeError:
+                self._gemma_model = model_cls.from_pretrained(
+                    model_ref,
+                    torch_dtype=dtype_value,
+                    device_map=device_map,
+                )
+            self._gemma_processor = processor_cls.from_pretrained(model_ref)
+            self._gemma_pipe = None
+            self._gemma_loaded_ref = f"objects:{model_ref}"
+
+        messages = self._gemma_messages_for_audio(audio_path)
+        inputs = self._gemma_processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(self._gemma_model.device, dtype=self._gemma_model.dtype)
+        outputs = self._gemma_model.generate(
+            **inputs,
+            max_new_tokens=int(self.config.get("gemma_max_new_tokens", 192)),
+        )
+        decoded = self._gemma_processor.batch_decode(
+            outputs,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        return self._extract_gemma_text(decoded), None
+
+    def _extract_gemma_text(self, value: Any) -> str:
+        if isinstance(value, list):
+            if not value:
+                return ""
+            first = value[0]
+            if isinstance(first, dict):
+                generated = first.get("generated_text", first.get("text", ""))
+                if isinstance(generated, list):
+                    parts = []
+                    for item in generated:
+                        if isinstance(item, dict):
+                            parts.append(str(item.get("text", "")))
+                        else:
+                            parts.append(str(item))
+                    return self._clean_gemma_text(" ".join(parts))
+                return self._clean_gemma_text(str(generated))
+            return self._clean_gemma_text(str(first))
+        return self._clean_gemma_text(str(value))
+
+    def _clean_gemma_text(self, text: str) -> str:
+        text = text.strip()
+        if "<|turn>model" in text:
+            text = text.rsplit("<|turn>model", 1)[-1]
+        if "<turn|>" in text:
+            text = text.split("<turn|>", 1)[0]
+        text = re.sub(r"<\|[^>]+?\|>", "", text)
+        text = text.replace("<bos>", "").replace("<eos>", "")
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
 
     def _route_transcript(self, text: str) -> str:
         # If recording started from GUI button, prefer showing transcript in GUI only.
@@ -1400,6 +3135,23 @@ class RecorderController:
                     "route: recovered start target from focus tracker "
                     f"app={cached.source_app!r} pid={cached.source_pid}"
                 )
+
+        if (
+            self._capture_focus
+            and self._focus_target is None
+            and self._focus_target_at_start is None
+            and bool(self.config.get("ask_when_focus_uncertain", False))
+        ):
+            if copy_to_clipboard(text):
+                self._last_route_note = (
+                    "No reliable target window was captured; focus the target and use paste-last."
+                )
+                speak_prompt(
+                    "I could not identify the target window. Focus the window and say voice typing paste last.",
+                    bool(self.config.get("voice_prompts_enabled", False)),
+                )
+                log_routing("route: clipboard_only because focus target was uncertain")
+                return "clipboard_only"
 
         if self._capture_focus and self._focus_target is not None:
             # Ignore accidental self-target capture from the GUI process.
@@ -1708,7 +3460,12 @@ class IpcServer(threading.Thread):
             return {
                 "ok": True,
                 "recording": self.controller.is_recording(),
+                "busy": self.controller.is_transcribing(),
+                "engine": self.config.transcription_engine(),
                 "model": self.config.get("model", ""),
+                "gemma_model": self.config.gemma_model_ref(),
+                "ollama_model": self.config.ollama_model(),
+                "audio_input_device": self.config.get("audio_input_device", "") or "default",
             }
 
         if cmd == "show":
@@ -1728,6 +3485,9 @@ class IpcServer(threading.Thread):
         if cmd == "list_models":
             return {"ok": True, "models": self.config.list_models()}
 
+        if cmd == "list_engines":
+            return {"ok": True, "engines": list(SUPPORTED_TRANSCRIPTION_ENGINES)}
+
         if cmd == "set_model":
             model = str(req.get("model", "")).strip()
             if not model:
@@ -1737,6 +3497,38 @@ class IpcServer(threading.Thread):
                 return {"ok": False, "error": f"model not found in models dir: {model}"}
             self.config.set("model", model)
             return {"ok": True, "message": f"model set to {model}"}
+
+        if cmd == "set_audio_input":
+            device = str(req.get("device", "")).strip()
+            self.config.set("audio_input_device", "" if device in {"", "default", "-d"} else device)
+            label = self.config.get("audio_input_device", "") or "default"
+            return {"ok": True, "message": f"audio input set to {label}"}
+
+        if cmd == "set_engine":
+            engine = str(req.get("engine", "")).strip().lower()
+            engine = ENGINE_ALIASES.get(engine, engine)
+            if engine not in SUPPORTED_TRANSCRIPTION_ENGINES:
+                return {"ok": False, "error": f"engine must be one of: {', '.join(SUPPORTED_TRANSCRIPTION_ENGINES)}"}
+            self.config.set("transcription_engine", engine)
+            return {"ok": True, "message": f"engine set to {engine}"}
+
+        if cmd == "set_gemma_model":
+            model = str(req.get("model", "")).strip()
+            if not model:
+                return {"ok": False, "error": "model is required"}
+            if model.startswith("/") or model.startswith("~"):
+                self.config.set("gemma_model_path", model)
+            else:
+                self.config.set("gemma_model", model)
+                self.config.set("gemma_model_path", "")
+            return {"ok": True, "message": f"Gemma model set to {model}"}
+
+        if cmd == "set_ollama_model":
+            model = str(req.get("model", "")).strip()
+            if not model:
+                return {"ok": False, "error": "model is required"}
+            self.config.set("ollama_model", model)
+            return {"ok": True, "message": f"Ollama model set to {model}"}
 
         return {"ok": False, "error": f"unknown command: {cmd}"}
 
@@ -1755,8 +3547,8 @@ class VoiceTypingGui:
 
         self.root = tk.Tk()
         self.root.title(APP_NAME)
-        self.root.geometry("420x220")
-        self.root.minsize(320, 150)
+        self.root.geometry("560x420")
+        self.root.minsize(440, 320)
         self.root.configure(bg="#0f1115")
         self.root.withdraw()
         self.root.resizable(True, True)
@@ -1774,12 +3566,16 @@ class VoiceTypingGui:
         self.status_var = tk.StringVar(value="Idle")
         self.elapsed_var = tk.StringVar(value="00:00")
         self.route_var = tk.StringVar(value="Target: none yet")
+        self.engine_var = tk.StringVar(value=self.config.transcription_engine())
         self.model_var = tk.StringVar(value=str(self.config.get("model", "")))
+        self.gemma_model_var = tk.StringVar(value=self.config.gemma_model_ref())
+        self.ollama_model_var = tk.StringVar(value=self.config.ollama_model())
 
         self.controller = RecorderController(
             config=self.config,
             on_state_change=lambda recording, reason: self.events.put(("state", recording, reason)),
             on_transcript=lambda text, route: self.events.put(("transcript", text, route)),
+            on_audio_quality=lambda verdict, message: self.events.put(("audio_quality", verdict, message)),
         )
         self.ipc = IpcServer(
             self.controller,
@@ -1856,22 +3652,86 @@ class VoiceTypingGui:
         root_pad = ttk.Frame(self.root, padding=10, style="VT.Root.TFrame")
         root_pad.pack(fill="both", expand=True)
 
-        top = ttk.Frame(root_pad, style="VT.Card.TFrame", padding=(8, 8))
-        top.pack(fill="x")
+        # Plain tk widgets here so the whole bar can change color with state.
+        self.status_bar = tk.Frame(root_pad, bg="#171a20", padx=10, pady=8)
+        self.status_bar.pack(fill="x")
 
-        self.dot = tk.Canvas(top, width=12, height=12, highlightthickness=0, bd=0, bg="#171a20")
-        self.dot.pack(side="left", padx=(0, 6))
-        self.dot_indicator = self.dot.create_oval(1, 1, 11, 11, fill="#22c55e", outline="")
+        self.dot = tk.Canvas(self.status_bar, width=18, height=18, highlightthickness=0, bd=0, bg="#171a20")
+        self.dot.pack(side="left", padx=(0, 8))
+        self.dot_indicator = self.dot.create_oval(2, 2, 16, 16, fill="#475569", outline="")
 
-        ttk.Label(top, textvariable=self.status_var, style="VT.Status.TLabel").pack(side="left")
-        ttk.Label(top, textvariable=self.elapsed_var, style="VT.Meta.TLabel").pack(side="left", padx=(8, 0))
+        self.status_label = tk.Label(
+            self.status_bar,
+            textvariable=self.status_var,
+            font=("DejaVu Sans Mono", 13, "bold"),
+            fg="#94a3b8",
+            bg="#171a20",
+        )
+        self.status_label.pack(side="left")
+        self.elapsed_label = tk.Label(
+            self.status_bar,
+            textvariable=self.elapsed_var,
+            font=("DejaVu Sans Mono", 12),
+            fg="#94a3b8",
+            bg="#171a20",
+        )
+        self.elapsed_label.pack(side="left", padx=(10, 0))
 
-        self.toggle_btn = ttk.Button(top, text="Record", style="VT.TButton", command=self._toggle_from_gui)
+        self.toggle_btn = ttk.Button(self.status_bar, text="Record", style="VT.TButton", command=self._toggle_from_gui)
         self.toggle_btn.pack(side="right")
+
+        mode_row = ttk.Frame(root_pad, style="VT.Root.TFrame")
+        mode_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(mode_row, text="Mode:", style="VT.Meta.TLabel").pack(side="left")
+        self.stable_mode_btn = tk.Button(
+            mode_row,
+            text="Stable · Whisper",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=3,
+            font=("DejaVu Sans Mono", 10, "bold"),
+            command=lambda: self._apply_profile("stable"),
+        )
+        self.stable_mode_btn.pack(side="left", padx=(8, 4))
+        self.gemma_mode_btn = tk.Button(
+            mode_row,
+            text="Gemma Agent · Ollama",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=3,
+            font=("DejaVu Sans Mono", 10, "bold"),
+            command=lambda: self._apply_profile("gemma-agent"),
+        )
+        self.gemma_mode_btn.pack(side="left", padx=(0, 4))
+        self.ask_mode_btn = tk.Button(
+            mode_row,
+            text="Ask Gemma",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=3,
+            font=("DejaVu Sans Mono", 10, "bold"),
+            command=lambda: self._apply_profile("ask-gemma"),
+        )
+        self.ask_mode_btn.pack(side="left", padx=(0, 4))
+        self._update_mode_buttons()
 
         ttk.Label(root_pad, textvariable=self.route_var, style="VT.Meta.TLabel").pack(
             anchor="w", pady=(4, 0)
         )
+
+        self.mic_quality_var = tk.StringVar(value="")
+        self.mic_quality_label = tk.Label(
+            root_pad,
+            textvariable=self.mic_quality_var,
+            font=("DejaVu Sans Mono", 9),
+            fg="#64748b",
+            bg="#0f1115",
+            anchor="w",
+        )
+        self.mic_quality_label.pack(fill="x", pady=(2, 0))
 
         transcript_frame = ttk.Frame(root_pad, style="VT.Card.TFrame", padding=(8, 8))
         transcript_frame.pack(fill="both", expand=True, pady=(8, 6))
@@ -1894,13 +3754,48 @@ class VoiceTypingGui:
         options_frame = ttk.Frame(root_pad, style="VT.Card.TFrame", padding=(8, 8))
         options_frame.pack(fill="x")
 
+        engine_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
+        engine_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(engine_row, text="Engine:", style="VT.Meta.TLabel").pack(side="left")
+        self.engine_combo = ttk.Combobox(
+            engine_row,
+            textvariable=self.engine_var,
+            state="readonly",
+            values=list(SUPPORTED_TRANSCRIPTION_ENGINES),
+            width=10,
+        )
+        self.engine_combo.pack(side="left", padx=(6, 8))
+        self.engine_combo.bind("<<ComboboxSelected>>", self._on_engine_selected)
+
         model_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
-        model_row.pack(fill="x", pady=(8, 4))
-        ttk.Label(model_row, text="Model:", style="VT.Meta.TLabel").pack(side="left")
+        model_row.pack(fill="x", pady=(4, 4))
+        ttk.Label(model_row, text="Whisper:", style="VT.Meta.TLabel").pack(side="left")
         self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var, state="readonly")
         self.model_combo.pack(side="left", fill="x", expand=True, padx=(6, 6))
         self.model_combo.bind("<<ComboboxSelected>>", self._on_model_selected)
         ttk.Button(model_row, text="Refresh", style="VT.Detail.TButton", command=self._refresh_models).pack(
+            side="left"
+        )
+
+        gemma_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
+        gemma_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(gemma_row, text="Gemma:", style="VT.Meta.TLabel").pack(side="left")
+        self.gemma_model_entry = ttk.Entry(gemma_row, textvariable=self.gemma_model_var)
+        self.gemma_model_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
+        ttk.Button(gemma_row, text="Apply", style="VT.Detail.TButton", command=self._on_gemma_model_applied).pack(
+            side="left"
+        )
+
+        ollama_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
+        ollama_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(ollama_row, text="Ollama:", style="VT.Meta.TLabel").pack(side="left")
+        self.ollama_combo = ttk.Combobox(ollama_row, textvariable=self.ollama_model_var)
+        self.ollama_combo.pack(side="left", fill="x", expand=True, padx=(6, 6))
+        self.ollama_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_ollama_model_applied())
+        ttk.Button(
+            ollama_row, text="Refresh", style="VT.Detail.TButton", command=self._refresh_ollama_models
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(ollama_row, text="Apply", style="VT.Detail.TButton", command=self._on_ollama_model_applied).pack(
             side="left"
         )
 
@@ -1911,6 +3806,9 @@ class VoiceTypingGui:
         self.always_on_top_var = tk.BooleanVar(value=bool(self.config.get("window_always_on_top", True)))
         self.show_on_hotkey_var = tk.BooleanVar(value=bool(self.config.get("show_panel_on_hotkey_start", True)))
         self.use_gpu_var = tk.BooleanVar(value=not bool(self.config.get("no_gpu", True)))
+        self.streaming_var = tk.BooleanVar(value=bool(self.config.get("streaming_transcription", False)))
+        self.voice_commands_var = tk.BooleanVar(value=bool(self.config.get("voice_commands_enabled", True)))
+        self.speak_answers_var = tk.BooleanVar(value=bool(self.config.get("answer_speak_aloud", True)))
 
         ttk.Checkbutton(
             options_frame,
@@ -1952,6 +3850,30 @@ class VoiceTypingGui:
             style="VT.TCheckbutton",
         ).pack(anchor="w", pady=(2, 0))
 
+        ttk.Checkbutton(
+            options_frame,
+            text="Rolling chunks while recording",
+            variable=self.streaming_var,
+            command=self._save_options,
+            style="VT.TCheckbutton",
+        ).pack(anchor="w", pady=(2, 0))
+
+        ttk.Checkbutton(
+            options_frame,
+            text="Voice commands",
+            variable=self.voice_commands_var,
+            command=self._save_options,
+            style="VT.TCheckbutton",
+        ).pack(anchor="w", pady=(2, 0))
+
+        ttk.Checkbutton(
+            options_frame,
+            text="Speak answers aloud (Ask Gemma mode)",
+            variable=self.speak_answers_var,
+            command=self._save_options,
+            style="VT.TCheckbutton",
+        ).pack(anchor="w", pady=(2, 0))
+
         bottom = ttk.Frame(options_frame, style="VT.Card.TFrame")
         bottom.pack(fill="x")
         ttk.Button(bottom, text="Copy Last", style="VT.Detail.TButton", command=self._copy_last_transcript).pack(
@@ -1961,11 +3883,70 @@ class VoiceTypingGui:
             side="left",
             padx=(6, 0),
         )
+        ttk.Button(
+            bottom, text="Retry Last Audio", style="VT.Detail.TButton", command=self._retry_last_audio
+        ).pack(side="left", padx=(6, 0))
         ttk.Button(bottom, text="Model Help", style="VT.Detail.TButton", command=self._show_model_help).pack(
             side="right"
         )
 
         self._refresh_models()
+        self._refresh_ollama_models()
+
+    def _refresh_ollama_models(self) -> None:
+        def _fetch() -> None:
+            names = list_ollama_models(self.config.ollama_url())
+            if names:
+                self.events.put(("ollama_models", names, None))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _apply_profile(self, profile: str) -> None:
+        updates = PROFILE_CONFIGS.get(profile)
+        if not updates:
+            return
+        if self.controller.is_recording() or self.controller.is_transcribing():
+            notify("Voice typing", "Stop recording before switching mode")
+            return
+        for key, value in updates.items():
+            self.config.set(key, value)
+        self.config.set("active_profile", profile)
+        self.engine_var.set(self.config.transcription_engine())
+        self.streaming_var.set(bool(self.config.get("streaming_transcription", False)))
+        self.voice_commands_var.set(bool(self.config.get("voice_commands_enabled", True)))
+        self._update_mode_buttons()
+        if profile in ("gemma-agent", "ask-gemma"):
+            # Start loading the model now instead of on first use.
+            self.controller.warm_up_transcriber_async()
+        self.route_var.set(f"Mode switched to {profile}.")
+        notify("Voice typing", f"Mode: {profile}")
+
+    def _update_mode_buttons(self) -> None:
+        engine = self.config.transcription_engine()
+        answer_mode = bool(self.config.get("assistant_answer_mode", False))
+        active = {"bg": "#ea580c", "fg": "#fff7ed", "activebackground": "#fb923c", "activeforeground": "#fff7ed"}
+        inactive = {"bg": "#2b313b", "fg": "#94a3b8", "activebackground": "#3d4653", "activeforeground": "#e2e8f0"}
+        self.stable_mode_btn.configure(**(active if engine == "whisper" and not answer_mode else inactive))
+        self.gemma_mode_btn.configure(**(active if engine == "ollama" and not answer_mode else inactive))
+        self.ask_mode_btn.configure(**(active if answer_mode else inactive))
+
+    def _set_visual_state(self, state: str) -> None:
+        palettes = {
+            "idle": {"bar": "#171a20", "fg": "#94a3b8", "dot": "#475569", "title": APP_NAME},
+            "recording": {"bar": "#7f1d1d", "fg": "#fee2e2", "dot": "#f87171", "title": f"● RECORDING — {APP_NAME}"},
+            "transcribing": {"bar": "#78350f", "fg": "#ffedd5", "dot": "#fbbf24", "title": f"… Transcribing — {APP_NAME}"},
+        }
+        palette = palettes.get(state, palettes["idle"])
+        self._visual_state = state
+        self.status_bar.configure(bg=palette["bar"])
+        self.dot.configure(bg=palette["bar"])
+        self.dot.itemconfig(self.dot_indicator, fill=palette["dot"])
+        self.status_label.configure(bg=palette["bar"], fg=palette["fg"])
+        self.elapsed_label.configure(bg=palette["bar"], fg=palette["fg"])
+        try:
+            self.root.title(palette["title"])
+        except Exception:
+            pass
 
     def _refresh_models(self) -> None:
         models = self.config.list_models()
@@ -1986,6 +3967,34 @@ class VoiceTypingGui:
             return
         self.config.set("model", model)
 
+    def _on_engine_selected(self, _event: Any) -> None:
+        engine = self.engine_var.get().strip().lower()
+        engine = ENGINE_ALIASES.get(engine, engine)
+        if engine not in SUPPORTED_TRANSCRIPTION_ENGINES:
+            return
+        self.config.set("transcription_engine", engine)
+        self._update_mode_buttons()
+        if engine == "ollama":
+            self.controller.warm_up_transcriber_async()
+
+    def _on_gemma_model_applied(self) -> None:
+        model_ref = self.gemma_model_var.get().strip()
+        if not model_ref:
+            return
+        if model_ref.startswith("/") or model_ref.startswith("~"):
+            self.config.set("gemma_model_path", model_ref)
+        else:
+            self.config.set("gemma_model", model_ref)
+            self.config.set("gemma_model_path", "")
+        notify("Voice typing", f"Gemma model set to {model_ref}")
+
+    def _on_ollama_model_applied(self) -> None:
+        model_ref = self.ollama_model_var.get().strip()
+        if not model_ref:
+            return
+        self.config.set("ollama_model", model_ref)
+        notify("Voice typing", f"Ollama model set to {model_ref}")
+
     def _save_options(self) -> None:
         self.config.set("auto_paste_current_focus", bool(self.auto_paste_var.get()))
         self.config.set(
@@ -1995,6 +4004,9 @@ class VoiceTypingGui:
         self.config.set("window_always_on_top", bool(self.always_on_top_var.get()))
         self.config.set("show_panel_on_hotkey_start", bool(self.show_on_hotkey_var.get()))
         self.config.set("no_gpu", not bool(self.use_gpu_var.get()))
+        self.config.set("streaming_transcription", bool(self.streaming_var.get()))
+        self.config.set("voice_commands_enabled", bool(self.voice_commands_var.get()))
+        self.config.set("answer_speak_aloud", bool(self.speak_answers_var.get()))
         self._apply_window_presentation()
 
     def _toggle_from_gui(self) -> None:
@@ -2004,9 +4016,16 @@ class VoiceTypingGui:
             notify("Voice typing", message, urgency="critical")
 
     def _stop_from_gui(self) -> None:
+        self.controller.speaker.stop()
         ok, message = self.controller.stop_recording_async(reason="manual_stop")
         if not ok:
             self.status_var.set(message)
+
+    def _retry_last_audio(self) -> None:
+        ok, message = self.controller.retranscribe_path_async()
+        self.route_var.set(message)
+        if not ok:
+            notify("Voice typing", message, urgency="critical")
 
     def _copy_last_transcript(self) -> None:
         self.transcript_box.configure(state="normal")
@@ -2021,11 +4040,15 @@ class VoiceTypingGui:
         models_dir = self.config.models_dir()
         whisper_dir = self.config.whisper_cli_path().parent.parent.parent
         msg = (
-            "To download models, run one of these commands in a terminal:\n\n"
+            "Whisper models:\n\n"
             f"cd {whisper_dir}\n"
             "./models/download-ggml-model.sh small.en\n"
             "./models/download-ggml-model.sh base.en\n\n"
-            f"Then click Refresh.\nCurrent models directory: {models_dir}"
+            f"Then click Refresh.\nCurrent models directory: {models_dir}\n\n"
+            "Gemma 4 through Transformers is optional. Set Engine = gemma4-transformers and use either "
+            "google/gemma-4-E4B-it or a local model directory. Gemma audio clips are "
+            "processed as rolling chunks of 30 seconds or less.\n\n"
+            "For the existing local Gemma model, set Engine = ollama and Ollama = gemma4:latest."
         )
         messagebox.showinfo("Model Help", msg)
 
@@ -2045,18 +4068,39 @@ class VoiceTypingGui:
                 recording = bool(data)
                 reason = str(meta)
                 if recording:
-                    self.status_var.set("Recording...")
-                    self.dot.itemconfig(self.dot_indicator, fill="#dc2626")
+                    self.status_var.set("● RECORDING")
+                    self._set_visual_state("recording")
                     self.toggle_btn.configure(text="Stop")
                     if reason == "warning":
-                        self.status_var.set("Recording... (near limit)")
+                        self.status_var.set("● RECORDING (near limit)")
                 else:
                     self.status_var.set("Idle")
-                    self.dot.itemconfig(self.dot_indicator, fill="#16a34a")
+                    self._set_visual_state("idle")
                     self.toggle_btn.configure(text="Record")
                     if reason == "limit_or_error":
                         self.status_var.set("Stopped (limit reached)")
                 self._apply_window_presentation()
+
+            if event == "audio_quality":
+                verdict = str(data)
+                message = str(meta)
+                colors = {
+                    "good": "#4ade80",
+                    "quiet": "#facc15",
+                    "very_quiet": "#fb923c",
+                    "clipping": "#fb923c",
+                    "silent": "#f87171",
+                }
+                self.mic_quality_var.set(message)
+                self.mic_quality_label.configure(fg=colors.get(verdict, "#64748b"))
+
+            if event == "ollama_models":
+                names = list(data) if isinstance(data, (list, tuple)) else []
+                if names:
+                    self.ollama_combo["values"] = names
+                    current = self.config.ollama_model()
+                    if current in names:
+                        self.ollama_model_var.set(current)
 
             if event == "transcript":
                 text = str(data)
@@ -2076,6 +4120,7 @@ class VoiceTypingGui:
                     "clipboard+pasted": "Ready: copied and pasted into current focus.",
                     "clipboard_only": "Ready: copied to clipboard. Auto-paste failed.",
                     "gui_only": "Ready: stored in GUI transcript box.",
+                    "awaiting_target": "Waiting: choose a target window.",
                     "empty": "Ready: no text detected.",
                 }.get(route, "Transcript processed.")
                 self.status_var.set(route_label)
@@ -2087,7 +4132,30 @@ class VoiceTypingGui:
                 self._show_window(active=bool(meta) if meta is not None else True)
 
     def _update_elapsed(self) -> None:
-        if not self.controller.is_recording():
+        recording = self.controller.is_recording()
+        transcribing = self.controller.is_transcribing()
+        current = getattr(self, "_visual_state", "idle")
+
+        # The transcribing phase has no controller event of its own, so the
+        # 200ms tick keeps the bar in sync with it.
+        if not recording and transcribing and current != "transcribing":
+            self.status_var.set("Transcribing…")
+            self._set_visual_state("transcribing")
+        elif not recording and not transcribing and current == "transcribing":
+            self.status_var.set("Idle")
+            self._set_visual_state("idle")
+
+        if current == "recording":
+            # Blink the dot roughly every 600ms so recording is unmissable.
+            self._blink_tick = getattr(self, "_blink_tick", 0) + 1
+            if self._blink_tick % 3 == 0:
+                fill = self.dot.itemcget(self.dot_indicator, "fill")
+                self.dot.itemconfig(
+                    self.dot_indicator,
+                    fill="#7f1d1d" if fill == "#f87171" else "#f87171",
+                )
+
+        if not recording:
             self.elapsed_var.set("00:00")
             return
 
@@ -2423,6 +4491,270 @@ def cmd_list_models() -> int:
     return 0
 
 
+def cmd_list_engines() -> int:
+    for engine in SUPPORTED_TRANSCRIPTION_ENGINES:
+        print(engine)
+    return 0
+
+
+def _command_lines(cmd: list[str], timeout: float = 2.0) -> list[str]:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    return (result.stdout or "").splitlines()
+
+
+def cmd_list_audio_inputs() -> int:
+    print("default")
+    seen = {"default"}
+    for line in _command_lines(["pactl", "list", "short", "sources"]):
+        parts = line.split()
+        if len(parts) >= 2 and ".monitor" not in parts[1]:
+            name = f"pulse:{parts[1]}"
+            if name not in seen:
+                print(name)
+                seen.add(name)
+    for line in _command_lines(["arecord", "-L"]):
+        if line and not line.startswith((" ", "\t")) and line not in {"null", "default"}:
+            name = f"alsa:{line}"
+            if name not in seen:
+                print(name)
+                seen.add(name)
+    return 0
+
+
+def cmd_set_audio_input(device: str) -> int:
+    device = device.strip()
+    value = "" if device in {"", "default", "-d"} else device
+    resp = send_ipc_with_retries({"cmd": "set_audio_input", "device": value}, attempts=2, timeout=1.2)
+    if resp is None:
+        cfg = ConfigManager(CONFIG_PATH)
+        cfg.set("audio_input_device", value)
+        print(f"audio input set to {value or 'default'}")
+        return 0
+    if resp.get("ok"):
+        print(resp.get("message", "ok"))
+        return 0
+    print(resp.get("error", "failed"))
+    return 1
+
+
+def cmd_list_windows() -> int:
+    windows = list_open_windows(limit=12)
+    if not windows:
+        print("No windows found")
+        return 1
+    for item in windows:
+        title = str(item.get("title", "")).strip()
+        wm_class = str(item.get("wm_class", "")).strip()
+        pid = item.get("pid")
+        label = title or wm_class
+        if wm_class and wm_class.lower() not in label.lower():
+            label = f"{wm_class}: {label}"
+        print(f"{pid}: {label}")
+    return 0
+
+
+def cmd_set_engine(engine: str) -> int:
+    engine = engine.strip().lower()
+    engine = ENGINE_ALIASES.get(engine, engine)
+    if engine not in SUPPORTED_TRANSCRIPTION_ENGINES:
+        print(f"Engine must be one of: {', '.join(SUPPORTED_TRANSCRIPTION_ENGINES)}")
+        return 1
+
+    resp = send_ipc_with_retries({"cmd": "set_engine", "engine": engine}, attempts=2, timeout=1.2)
+    if resp is None:
+        cfg = ConfigManager(CONFIG_PATH)
+        cfg.set("transcription_engine", engine)
+        print(f"engine set to {engine}")
+        return 0
+    if resp.get("ok"):
+        print(resp.get("message", "ok"))
+        return 0
+    print(resp.get("error", "failed"))
+    return 1
+
+
+def cmd_set_gemma_model(model: str) -> int:
+    model = model.strip()
+    if not model:
+        print("model is required")
+        return 1
+
+    resp = send_ipc_with_retries({"cmd": "set_gemma_model", "model": model}, attempts=2, timeout=1.2)
+    if resp is None:
+        cfg = ConfigManager(CONFIG_PATH)
+        if model.startswith("/") or model.startswith("~"):
+            cfg.set("gemma_model_path", model)
+        else:
+            cfg.set("gemma_model", model)
+            cfg.set("gemma_model_path", "")
+        print(f"Gemma model set to {model}")
+        return 0
+    if resp.get("ok"):
+        print(resp.get("message", "ok"))
+        return 0
+    print(resp.get("error", "failed"))
+    return 1
+
+
+def cmd_set_ollama_model(model: str) -> int:
+    model = model.strip()
+    if not model:
+        print("model is required")
+        return 1
+
+    resp = send_ipc_with_retries({"cmd": "set_ollama_model", "model": model}, attempts=2, timeout=1.2)
+    if resp is None:
+        cfg = ConfigManager(CONFIG_PATH)
+        cfg.set("ollama_model", model)
+        print(f"Ollama model set to {model}")
+        return 0
+    if resp.get("ok"):
+        print(resp.get("message", "ok"))
+        return 0
+    print(resp.get("error", "failed"))
+    return 1
+
+
+def cmd_set_profile(profile: str) -> int:
+    profile = profile.strip().lower()
+    updates = PROFILE_CONFIGS.get(profile)
+    if updates is None:
+        print(f"Profile must be one of: {', '.join(sorted(PROFILE_CONFIGS))}")
+        return 1
+    cfg = ConfigManager(CONFIG_PATH)
+    for key, value in updates.items():
+        cfg.data[key] = value
+    cfg.data["active_profile"] = profile
+    cfg.save()
+    print(f"profile set to {profile}")
+    if send_ipc_with_retries({"cmd": "status"}, attempts=1, timeout=0.25) is not None:
+        print("Restart the Voice Typing GUI for profile changes to fully apply.")
+    return 0
+
+
+def cmd_ask(question: str, speak: bool) -> int:
+    cfg = ConfigManager(CONFIG_PATH)
+    controller = RecorderController(config=cfg)
+    model_name = cfg.ollama_model()
+    if model_name not in {str(item.get("model", "")) for item in _ollama_loaded_models(cfg.ollama_url())}:
+        print(f"(loading {model_name} — a cold start can take a minute...)", file=sys.stderr)
+    if speak and controller.speaker.available():
+        spoken: list[str] = []
+
+        def _on_sentence(sentence: str) -> None:
+            spoken.append(sentence)
+            controller.speaker.speak(sentence)
+            print(sentence, flush=True)
+
+        answer, err = controller.ask_ollama_stream(question, _on_sentence)
+        if err:
+            print(err)
+            return 1
+        # Wait for playback of queued sentences to finish.
+        while controller.speaker.is_busy():
+            time.sleep(0.3)
+        return 0
+    answer, err = controller.ask_ollama(question)
+    if err:
+        print(err)
+        return 1
+    print(answer)
+    return 0
+
+
+def cmd_list_recordings() -> int:
+    cfg = ConfigManager(CONFIG_PATH)
+    controller = RecorderController(config=cfg)
+    recordings_dir = controller.recordings_dir()
+    wavs = sorted(recordings_dir.glob("*.wav")) if recordings_dir.exists() else []
+    if not wavs:
+        print(f"No saved recordings in {recordings_dir}")
+        return 1
+    for wav in wavs:
+        duration = audio_duration_seconds(wav)
+        mins, secs = divmod(int(duration), 60)
+        print(f"{wav.name}  {mins:02d}:{secs:02d}  {wav.stat().st_size // 1024} KB")
+    return 0
+
+
+def cmd_retranscribe(target: str) -> int:
+    cfg = ConfigManager(CONFIG_PATH)
+    controller = RecorderController(config=cfg)
+    if target in ("", "last"):
+        audio_path = controller.last_recording_path()
+        if audio_path is None:
+            print(f"No saved recordings in {controller.recordings_dir()}")
+            return 1
+    else:
+        audio_path = Path(os.path.expanduser(target))
+        if not audio_path.is_absolute():
+            candidate = controller.recordings_dir() / target
+            if candidate.exists():
+                audio_path = candidate
+        if not audio_path.exists():
+            print(f"Audio file not found: {audio_path}")
+            return 1
+
+    duration = audio_duration_seconds(audio_path)
+    verdict, detail = analyze_audio_quality(audio_path)
+    if verdict:
+        print(f"audio quality: {AUDIO_QUALITY_LABELS.get(verdict, verdict)} ({detail})", file=sys.stderr)
+    print(f"Transcribing {audio_path} ({duration:.0f}s of audio) with engine '{cfg.transcription_engine()}'...")
+    text, err = controller._transcribe_audio_path(audio_path)
+    if err:
+        print(f"error: {err}")
+        return 1
+    transcript = text.strip()
+    if not transcript:
+        print("Transcript is empty")
+        return 1
+    print(transcript)
+    if copy_to_clipboard(transcript):
+        print("(copied to clipboard)", file=sys.stderr)
+    return 0
+
+
+def cmd_doctor() -> int:
+    cfg = ConfigManager(CONFIG_PATH)
+    engine = cfg.transcription_engine()
+    checks = {
+        "engine": engine,
+        "audio_input_device": cfg.get("audio_input_device", "") or "default",
+        "sox": shutil.which("sox") is not None,
+        "wl-copy": shutil.which("wl-copy") is not None,
+        "ydotool": shutil.which("ydotool") is not None,
+        "whisper_cli": cfg.whisper_cli_path().exists(),
+        "whisper_model": cfg.model_path().exists(),
+        "gemma_model": cfg.gemma_model_ref(),
+        "ollama_cli": shutil.which("ollama") is not None,
+        "ollama_model": cfg.ollama_model(),
+        "ollama_url": cfg.ollama_url(),
+        "python_torch": importlib.util.find_spec("torch") is not None,
+        "python_transformers": importlib.util.find_spec("transformers") is not None,
+        "python_accelerate": importlib.util.find_spec("accelerate") is not None,
+        "python_soundfile": importlib.util.find_spec("soundfile") is not None,
+    }
+    print(json.dumps(checks, indent=2))
+    required_by_engine = {
+        "whisper": ("sox", "whisper_cli", "whisper_model"),
+        "gemma4-transformers": (
+            "sox",
+            "python_torch",
+            "python_transformers",
+            "python_accelerate",
+            "python_soundfile",
+        ),
+        "ollama": ("sox", "ollama_cli"),
+    }.get(engine, ("sox",))
+    missing = [name for name in required_by_engine if checks.get(name) is False]
+    return 1 if missing else 0
+
+
 def reuse_existing_gui_instance(toggle_on_launch: bool) -> bool:
     status = send_ipc_with_retries({"cmd": "status"}, attempts=2, timeout=1.0, delay_seconds=0.15)
     if status is None:
@@ -2447,9 +4779,41 @@ def main() -> int:
     sub.add_parser("paste-last", help="Type last transcript into current focus (no clipboard)")
     sub.add_parser("status", help="Show controller status")
     sub.add_parser("list-models", help="List available whisper models")
+    sub.add_parser("list-engines", help="List transcription engines")
+    sub.add_parser("list-audio-inputs", help="List microphone/input devices")
+    sub.add_parser("list-windows", help="List open GNOME windows")
+    sub.add_parser("doctor", help="Check local runtime dependencies")
 
     set_model_parser = sub.add_parser("set-model", help="Set active whisper model")
     set_model_parser.add_argument("model", help="Model file name (example: ggml-small.en.bin)")
+
+    set_audio_parser = sub.add_parser("set-audio-input", help="Set microphone/input device")
+    set_audio_parser.add_argument("device", help="default, pulse:<source>, or alsa:<device>")
+
+    set_engine_parser = sub.add_parser("set-engine", help="Set transcription engine")
+    set_engine_parser.add_argument("engine", help="whisper, ollama, or gemma4-transformers")
+
+    set_gemma_parser = sub.add_parser("set-gemma-model", help="Set Gemma model id or local directory")
+    set_gemma_parser.add_argument("model", help="example: google/gemma-4-E4B-it or /path/to/model")
+
+    set_ollama_parser = sub.add_parser("set-ollama-model", help="Set Ollama model name")
+    set_ollama_parser.add_argument("model", help="example: gemma4:latest")
+
+    set_profile_parser = sub.add_parser("set-profile", help="Set a tested config profile")
+    set_profile_parser.add_argument("profile", help="stable, gemma-agent, or antonio")
+
+    sub.add_parser("list-recordings", help="List archived recordings")
+
+    ask_parser = sub.add_parser("ask", help="Ask the local Gemma (Ollama) a question")
+    ask_parser.add_argument("--speak", action="store_true", help="Speak the answer aloud with piper")
+    ask_parser.add_argument("question", nargs="+", help="The question text")
+
+    retranscribe_parser = sub.add_parser(
+        "retranscribe", help="Transcribe an archived recording again (default: newest)"
+    )
+    retranscribe_parser.add_argument(
+        "target", nargs="?", default="last", help="'last', a file name from list-recordings, or a path"
+    )
 
     args = parser.parse_args()
 
@@ -2485,8 +4849,32 @@ def main() -> int:
         return cmd_status()
     if args.command == "list-models":
         return cmd_list_models()
+    if args.command == "list-engines":
+        return cmd_list_engines()
+    if args.command == "list-audio-inputs":
+        return cmd_list_audio_inputs()
+    if args.command == "list-windows":
+        return cmd_list_windows()
     if args.command == "set-model":
         return cmd_set_model(args.model)
+    if args.command == "set-audio-input":
+        return cmd_set_audio_input(args.device)
+    if args.command == "set-engine":
+        return cmd_set_engine(args.engine)
+    if args.command == "set-gemma-model":
+        return cmd_set_gemma_model(args.model)
+    if args.command == "set-ollama-model":
+        return cmd_set_ollama_model(args.model)
+    if args.command == "set-profile":
+        return cmd_set_profile(args.profile)
+    if args.command == "list-recordings":
+        return cmd_list_recordings()
+    if args.command == "ask":
+        return cmd_ask(" ".join(args.question), speak=bool(args.speak))
+    if args.command == "retranscribe":
+        return cmd_retranscribe(args.target)
+    if args.command == "doctor":
+        return cmd_doctor()
 
     return 1
 
