@@ -86,7 +86,16 @@ Notes:
 
 ### 5. Piper TTS (bundled — nothing to install)
 
-The Piper binary ships in this repo (`piper_runtime/piper/piper`) together with two British voices. More voices are downloaded on demand into `piper_voices/` (see "Reader voices" below).
+The Piper binary ships in this repo (`piper_runtime/piper/piper`) together with two British voices. More voices are downloaded on demand into `piper_voices/` (see "Reader voices" below). This bundled Piper runtime uses CPU ONNX Runtime; GPU TTS would require installing or building a CUDA-enabled Piper/ONNX Runtime runtime and putting that `piper` binary on `PATH`.
+Verify the active runtime with `ldd "$(command -v piper || echo ./piper_runtime/piper/piper)" | grep -Ei 'cuda|onnxruntime'`; the bundled runtime has ONNX Runtime only, not CUDA providers.
+
+**Experimental GPU Piper runtime** — isolated from the bundled CPU runtime and from whisper.cpp:
+
+```bash
+./scripts/setup_piper_gpu_runtime.sh
+```
+
+This creates `~/piper-gpu/bin/piper`, a small Piper-compatible wrapper that uses `piper-tts` with `onnxruntime-gpu`. In the Voice Reading Settings panel, enable **Use GPU Piper runtime** and set the path to `~/piper-gpu/bin/piper`. Uncheck the box to roll back instantly to the bundled CPU Piper. Verify with `./voice_reading.py status` and `nvidia-smi` during a long read.
 
 ### 6. Optional: gemma4 through HuggingFace transformers
 
@@ -238,7 +247,10 @@ Full reference with defaults: [config.example.json](config.example.json). Highli
 - **"Graphics apps (Gazebo/RViz) use the RTX fine but Whisper/Ollama don't"** → graphics (OpenGL/Vulkan) and compute (CUDA) are separate driver paths; CUDA can be broken while rendering still works. Test compute health with `python3 -c "import torch; print(torch.cuda.is_available())"`. On dual-GPU laptops the desktop runs on the integrated GPU by design — that's fine; CUDA apps address the RTX directly.
 - **GPU sharing with robot sims** → everything fits 8 GB together (whisper small ≈ 0.5 GB transient, gemma4 e4b ≈ 2.6 GB, Gazebo+RViz ≈ 1.2 GB). To keep voice typing off the GPU during heavy sim work: untick "Use GPU" (whisper) and lower `ollama_keep_alive` so Gemma unloads when idle.
 - **Blank transcript right after pressing the hotkey** → duplicate GNOME shortcut events are ignored: toggles inside 0.8 s are dropped, and hotkey-started recordings cannot be stopped for the first 1.5 s.
-- **Blank audio / wrong microphone** → run `./voice_typing.py list-audio-inputs`, then choose a source such as `./voice_typing.py set-audio-input pulse:alsa_input.usb-MUSIC-BOOST_Trust_GXT_232_Microphone-00.mono-fallback`; truly silent captures are skipped before Whisper and reported as a selected-microphone problem.
+- **Blank audio / wrong microphone** → run `./voice_typing.py list-audio-inputs`, then choose a source such as `./voice_typing.py set-audio-input pulse:alsa_input.usb-MUSIC-BOOST_Trust_GXT_232_Microphone-00.mono-fallback`; if a pinned Pulse source disappears, recording is refused with a microphone error instead of being reported as a time limit. Truly silent captures are skipped before Whisper.
+- **Transcript goes to the wrong app** → the hotkey flow only trusts the focus target captured at start. If no reliable starting text box is found, the transcript is copied to the clipboard instead of being pasted into whatever happens to be focused later.
+- **Reader stop/start does not stop audio** → the reader now stops the current TTS/player process group before starting a new GUI or `read` request. `toggle` still means stop when already reading.
+- **Reader highlight timing** → Piper debug output provides generated audio duration per sentence, so sentence highlighting follows actual sentence boundaries. Piper does not provide exact word timestamps in this setup; word highlighting is therefore off by default and remains an optional estimated mode in Settings.
 - **Lost a transcription** → it isn't lost: `./voice_typing.py retranscribe`.
 - Routing decisions are logged to `/tmp/voice_typing/routing.log`.
 

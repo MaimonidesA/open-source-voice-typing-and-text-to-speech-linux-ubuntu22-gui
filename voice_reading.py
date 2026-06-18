@@ -15,6 +15,7 @@ import json
 import os
 import queue
 import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -68,6 +69,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "engine": "spd-say",
     "output_module": "",
     "piper_model": "",
+    "piper_gpu_enabled": False,
+    "piper_gpu_binary_path": str(Path.home() / "piper-gpu" / "bin" / "piper"),
     "rate": 0,  # speech-dispatcher scale: -100..100
     "pitch": 0,
     "language": "en",
@@ -549,11 +552,11 @@ def split_sentences_for_timing(text: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def detect_engines() -> list[str]:
+def detect_engines(config: "ConfigManager | None" = None) -> list[str]:
     engines: list[str] = []
     if shutil.which("spd-say"):
         engines.append("spd-say")
-    if resolve_piper_binary():
+    if resolve_piper_binary(config):
         engines.append("piper")
     if shutil.which("espeak-ng"):
         engines.append("espeak-ng")
@@ -562,7 +565,11 @@ def detect_engines() -> list[str]:
     return engines
 
 
-def resolve_piper_binary() -> str:
+def resolve_piper_binary(config: "ConfigManager | None" = None) -> str:
+    if config is not None and bool(config.get("piper_gpu_enabled", False)):
+        gpu_path = Path(os.path.expanduser(str(config.get("piper_gpu_binary_path", "")).strip()))
+        if gpu_path.exists() and os.access(gpu_path, os.X_OK):
+            return str(gpu_path)
     path_bin = shutil.which("piper")
     if path_bin:
         return path_bin
@@ -570,6 +577,16 @@ def resolve_piper_binary() -> str:
         if candidate.exists() and os.access(candidate, os.X_OK):
             return str(candidate)
     return ""
+
+
+def piper_runtime_label(config: "ConfigManager") -> str:
+    path = resolve_piper_binary(config)
+    if not path:
+        return "missing"
+    gpu_path = Path(os.path.expanduser(str(config.get("piper_gpu_binary_path", "")).strip()))
+    if bool(config.get("piper_gpu_enabled", False)) and gpu_path.exists() and Path(path) == gpu_path:
+        return f"gpu:{path}"
+    return f"cpu:{path}"
 
 
 def list_spd_module_files() -> list[str]:
@@ -843,6 +860,7 @@ class ReaderController:
         self._cancel_state_pre_emitted = False
         self._progress_stop = threading.Event()
         self._progress_thread: threading.Thread | None = None
+        self._run_id = 0
 
     def is_speaking(self) -> bool:
         with self._lock:
@@ -853,9 +871,8 @@ class ReaderController:
             return self._paused
 
     def read_selection_async(self) -> tuple[bool, str]:
-        with self._lock:
-            if self._speaking:
-                return False, "Already reading"
+        if self.is_speaking():
+            self.stop()
 
         text, source = get_selected_text(self.config)
         if not text:
@@ -883,16 +900,45 @@ class ReaderController:
             self._emit_progress(0, len(words))
         return self._start_async(speak_text, start_word_index=0)
 
+    def _terminate_process(self, proc: subprocess.Popen[str] | None) -> None:
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=0.7)
+            return
+        except Exception:
+            pass
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _is_current_run(self, run_id: int) -> bool:
+        with self._lock:
+            return run_id == self._run_id
+
     def _start_async(self, text: str, start_word_index: int = 0) -> tuple[bool, str]:
         with self._lock:
             if self._speaking:
                 return False, "Already reading"
+            self._run_id += 1
+            run_id = self._run_id
             self._speaking = True
             self._paused = False
             self._cancel_reason = ""
             self._cancel_state_pre_emitted = False
         self._emit_state(True, "reading")
-        threading.Thread(target=self._worker, args=(text, start_word_index), daemon=True).start()
+        threading.Thread(target=self._worker, args=(text, start_word_index, run_id), daemon=True).start()
         return True, "Reading started"
 
     def stop(self) -> tuple[bool, str]:
@@ -908,12 +954,8 @@ class ReaderController:
                 subprocess.run(["spd-say", "-S"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
-        if proc is not None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
         with self._lock:
+            self._run_id += 1
             self._speaking = False
             self._proc = None
             self._paused = False
@@ -921,6 +963,8 @@ class ReaderController:
             self._resume_word_index = 0
             self._cancel_reason = "stopped"
             self._cancel_state_pre_emitted = True
+        if proc is not None:
+            self._terminate_process(proc)
         self._emit_state(False, "stopped")
         return True, "Stopped"
 
@@ -950,15 +994,11 @@ class ReaderController:
                 subprocess.run(["spd-say", "-S"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
-        if proc is not None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
 
         next_index = min(total_words, max(0, word_index + 1))
         remaining = words[next_index:] if words else []
         with self._lock:
+            self._run_id += 1
             self._speaking = False
             self._proc = None
             self._paused = bool(remaining)
@@ -966,6 +1006,8 @@ class ReaderController:
             self._resume_text = " ".join(remaining) if remaining else ""
             self._cancel_reason = "paused"
             self._cancel_state_pre_emitted = True
+        if proc is not None:
+            self._terminate_process(proc)
         if remaining:
             self._emit_state(False, "paused")
             self._emit_progress(next_index, total_words)
@@ -1137,7 +1179,7 @@ class ReaderController:
         except Exception:
             return None
 
-    def _worker(self, text: str, start_word_index: int) -> None:
+    def _worker(self, text: str, start_word_index: int, run_id: int) -> None:
         engine = str(self.config.get("engine", "spd-say")).strip() or "spd-say"
         output_module = str(self.config.get("output_module", "")).strip()
         piper_model = str(self.config.get("piper_model", "")).strip()
@@ -1147,6 +1189,7 @@ class ReaderController:
         voice = str(self.config.get("voice", "")).strip()
         voice_type = str(self.config.get("voice_type", "male1")).strip()
         ultra_sync = bool(self.config.get("ultra_precise_highlight_sync", False))
+        sentence_sync = bool(self.config.get("highlight_sentences_enabled", True))
 
         rc = 1
         err_text = ""
@@ -1192,8 +1235,12 @@ class ReaderController:
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
+                    start_new_session=True,
                     text=True,
                 )
+                if not self._is_current_run(run_id):
+                    self._terminate_process(proc)
+                    return
             elif engine in {"espeak-ng", "espeak"} and shutil.which(engine):
                 # Map -100..100 onto a useful words-per-minute range.
                 wpm = max(90, min(420, 175 + (rate * 2)))
@@ -1207,11 +1254,15 @@ class ReaderController:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
+                    start_new_session=True,
                     text=True,
                 )
+                if not self._is_current_run(run_id):
+                    self._terminate_process(proc)
+                    return
                 proc_input = text
             elif engine == "piper":
-                piper_bin = resolve_piper_binary()
+                piper_bin = resolve_piper_binary(self.config)
                 if not piper_bin:
                     err_text = "Piper engine not found"
                     proc = None
@@ -1234,7 +1285,7 @@ class ReaderController:
                             "--length_scale",
                             f"{length_scale:.3f}",
                         ]
-                        if ultra_sync:
+                        if ultra_sync or sentence_sync:
                             cmd.append("--debug")
                         else:
                             cmd.append("--quiet")
@@ -1243,10 +1294,12 @@ class ReaderController:
                             stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE,
+                            start_new_session=True,
                             text=True,
                         )
                         with self._lock:
-                            self._proc = proc
+                            if run_id == self._run_id:
+                                self._proc = proc
                         proc_input = text
                         _, stderr_text = proc.communicate(input=proc_input, timeout=None)
                         proc_input = None
@@ -1254,12 +1307,11 @@ class ReaderController:
                         err_text = (stderr_text or "").strip()
                         already_waited = True
                         if rc == 0:
+                            if not self._is_current_run(run_id):
+                                return
                             wav_duration = self._wav_duration_seconds(wav_to_remove) if wav_to_remove else None
-                            sentence_count = len(re.findall(r"[.!?]+", text))
-                            if wav_duration is not None and sentence_count > 0:
-                                wav_duration = max(0.05, wav_duration - (0.16 * sentence_count))
-                            sentence_durs = self._parse_piper_sentence_durations(err_text) if ultra_sync else []
-                            if ultra_sync and sentence_durs:
+                            sentence_durs = self._parse_piper_sentence_durations(err_text) if (ultra_sync or sentence_sync) else []
+                            if sentence_durs:
                                 offsets = self._estimate_word_offsets_by_sentence(
                                     text=text,
                                     total_words=remaining_words,
@@ -1289,10 +1341,15 @@ class ReaderController:
                                         player_cmd,
                                         stdout=subprocess.DEVNULL,
                                         stderr=subprocess.PIPE,
+                                        start_new_session=True,
                                         text=True,
                                     )
                                     with self._lock:
-                                        self._proc = proc
+                                        if run_id == self._run_id:
+                                            self._proc = proc
+                                        else:
+                                            self._terminate_process(proc)
+                                            return
                                     _, play_stderr = proc.communicate(timeout=None)
                                     already_waited = True
                                     if proc.returncode == 0:
@@ -1308,7 +1365,8 @@ class ReaderController:
                 err_text = f"TTS engine not available: {engine}"
 
             with self._lock:
-                self._proc = proc
+                if run_id == self._run_id:
+                    self._proc = proc
 
             if proc is not None and not already_waited:
                 _, stderr_text = proc.communicate(input=proc_input, timeout=None)
@@ -1324,6 +1382,8 @@ class ReaderController:
                 except Exception:
                     pass
             with self._lock:
+                if run_id != self._run_id:
+                    return
                 cancelled_reason = self._cancel_reason
                 cancel_state_pre_emitted = self._cancel_state_pre_emitted
                 self._speaking = False
@@ -1458,7 +1518,13 @@ class IpcServer(threading.Thread):
             return {"ok": True, "message": "shown"}
 
         if cmd == "status":
-            return {"ok": True, "speaking": self.controller.is_speaking(), "engine": self.config.get("engine", "")}
+            return {
+                "ok": True,
+                "speaking": self.controller.is_speaking(),
+                "engine": self.config.get("engine", ""),
+                "piper_runtime": piper_runtime_label(self.config),
+                "piper_gpu_enabled": bool(self.config.get("piper_gpu_enabled", False)),
+            }
 
         return {"ok": False, "error": f"unknown command: {cmd}"}
 
@@ -1490,8 +1556,10 @@ class VoiceReadingGui:
         self.voice_var = tk.StringVar(value=str(self.config.get("voice", "")))
         self.voice_type_var = tk.StringVar(value=str(self.config.get("voice_type", "male1")))
         self.output_module_var = tk.StringVar(value=str(self.config.get("output_module", "")))
+        self.piper_gpu_var = tk.BooleanVar(value=bool(self.config.get("piper_gpu_enabled", False)))
+        self.piper_gpu_path_var = tk.StringVar(value=str(self.config.get("piper_gpu_binary_path", "")))
         self._piper_model_map: dict[str, str] = {}
-        available = detect_engines()
+        available = detect_engines(self.config)
         preferred = str(self.config.get("engine", "spd-say"))
         self.engine_var = tk.StringVar(value=preferred if preferred in available else (available[0] if available else "spd-say"))
 
@@ -1589,6 +1657,9 @@ class VoiceReadingGui:
         )
         self.status_label.pack(side="left")
         ttk.Button(self.status_bar, text="Read Selection", style="VR.TButton", command=self._read_from_gui).pack(side="right")
+        ttk.Button(self.status_bar, text="Settings", style="VR.TButton", command=self._toggle_settings).pack(
+            side="right", padx=(0, 6)
+        )
         self.pause_btn = ttk.Button(
             self.status_bar,
             textvariable=self.pause_btn_var,
@@ -1620,6 +1691,7 @@ class VoiceReadingGui:
         self.reading_box.tag_configure("current_word", background="#14532d", foreground="#ecfdf5", font=("DejaVu Sans Mono", 10, "bold"))
         self.reading_box.tag_configure("current_sentence", background="#123524", foreground="#ecfdf5")
 
+        self.settings_visible = False
         self.controls = ttk.Frame(root, style="VR.Card.TFrame", padding=(8, 8))
         self.controls.pack(fill="x", expand=False)
 
@@ -1627,7 +1699,7 @@ class VoiceReadingGui:
         row1.pack(fill="x", pady=(2, 2))
         ttk.Label(row1, text="Engine:", style="VR.Meta.TLabel").pack(side="left")
         engine_combo = ttk.Combobox(row1, textvariable=self.engine_var, state="readonly")
-        engine_combo["values"] = detect_engines() or ["spd-say", "espeak-ng", "espeak"]
+        engine_combo["values"] = detect_engines(self.config) or ["spd-say", "espeak-ng", "espeak"]
         engine_combo.pack(side="left", padx=(6, 12))
         engine_combo.bind("<<ComboboxSelected>>", self._on_engine_changed)
         ttk.Label(row1, text="Model:", style="VR.Meta.TLabel").pack(side="left")
@@ -1656,6 +1728,17 @@ class VoiceReadingGui:
         preprocess_combo["values"] = [PREPROCESS_MODE_LABELS[key] for key in PREPROCESS_MODE_LABELS]
         preprocess_combo.pack(side="left", padx=(6, 12))
         preprocess_combo.bind("<<ComboboxSelected>>", self._save_options)
+
+        row2c = ttk.Frame(self.controls, style="VR.Card.TFrame")
+        row2c.pack(fill="x", pady=(2, 2))
+        ttk.Checkbutton(
+            row2c,
+            text="Use GPU Piper runtime",
+            variable=self.piper_gpu_var,
+            command=self._save_options,
+            style="VR.TCheckbutton",
+        ).pack(side="left")
+        ttk.Entry(row2c, textvariable=self.piper_gpu_path_var).pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         row3 = ttk.Frame(self.controls, style="VR.Card.TFrame")
         row3.pack(fill="x", pady=(2, 2))
@@ -1741,18 +1824,29 @@ class VoiceReadingGui:
             style="VR.TCheckbutton",
         ).pack(anchor="w", pady=(2, 0))
 
-        footer = ttk.Frame(root, style="VR.Root.TFrame")
-        footer.pack(fill="x", pady=(6, 0))
-        ttk.Button(footer, text="Apply", style="VR.TButton", command=self._save_options).pack(side="right")
-        ttk.Button(footer, text="Refresh Models", style="VR.TButton", command=self._refresh_model_lists).pack(
+        self.footer = ttk.Frame(root, style="VR.Root.TFrame")
+        self.footer.pack(fill="x", pady=(6, 0))
+        ttk.Button(self.footer, text="Apply", style="VR.TButton", command=self._save_options).pack(side="right")
+        ttk.Button(self.footer, text="Refresh Models", style="VR.TButton", command=self._refresh_model_lists).pack(
             side="right", padx=(0, 6)
         )
-        ttk.Button(footer, text="Get GB Voices", style="VR.TButton", command=self._open_voice_downloader).pack(
+        ttk.Button(self.footer, text="Get GB Voices", style="VR.TButton", command=self._open_voice_downloader).pack(
             side="right", padx=(0, 6)
         )
-        ttk.Button(footer, text="Help", style="VR.TButton", command=self._show_help).pack(side="right", padx=(0, 6))
+        ttk.Button(self.footer, text="Help", style="VR.TButton", command=self._show_help).pack(side="right", padx=(0, 6))
+        self.controls.pack_forget()
+        self.footer.pack_forget()
 
         self._refresh_model_lists()
+
+    def _toggle_settings(self) -> None:
+        self.settings_visible = not self.settings_visible
+        if self.settings_visible:
+            self.controls.pack(fill="x", expand=False)
+            self.footer.pack(fill="x", pady=(6, 0))
+        else:
+            self.controls.pack_forget()
+            self.footer.pack_forget()
 
     def _show_help(self) -> None:
         msg = (
@@ -1883,6 +1977,8 @@ class VoiceReadingGui:
         self.config.set("language", self.lang_var.get().strip())
         self.config.set("voice", self.voice_var.get().strip())
         self.config.set("voice_type", self.voice_type_var.get().strip())
+        self.config.set("piper_gpu_enabled", bool(self.piper_gpu_var.get()))
+        self.config.set("piper_gpu_binary_path", self.piper_gpu_path_var.get().strip())
         self.config.set("prefer_primary_selection", bool(self.prefer_primary_var.get()))
         self.config.set("capture_selected_text_via_copy", bool(self.copy_fallback_var.get()))
         self.config.set("show_panel_on_hotkey", bool(self.show_hotkey_var.get()))

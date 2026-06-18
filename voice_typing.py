@@ -468,6 +468,21 @@ def sox_input_args(config: Any) -> tuple[list[str], dict[str, str] | None]:
     return ["-t", "alsa", device], None
 
 
+def audio_input_preflight_error(config: Any) -> str | None:
+    device = str(config.get("audio_input_device", "")).strip()
+    if not device.startswith("pulse:"):
+        return None
+    source = device.split(":", 1)[1]
+    try:
+        result = subprocess.run(["pactl", "list", "short", "sources"], capture_output=True, text=True, timeout=1.0)
+    except Exception:
+        return None
+    sources = {line.split()[1] for line in result.stdout.splitlines() if len(line.split()) >= 2}
+    if source and source not in sources:
+        return f"Selected microphone is not available: {source}"
+    return None
+
+
 def _ollama_loaded_models(base_url: str, timeout: float = 3.0) -> list[dict[str, Any]]:
     """Models currently loaded in memory (GET /api/ps); empty on failure."""
     try:
@@ -1618,7 +1633,7 @@ class RecorderController:
         if self._focus_target is None and self._focus_target_at_start is not None:
             resolved = resolve_focus_target_from_hint(self._focus_target_at_start)
             candidates.append(resolved)
-        candidates.append(self._recent_focus_target(max_age_seconds=max_age_seconds))
+        candidates.append(self._recent_focus_target(max_age_seconds=min(max_age_seconds, 1.0)))
 
         for candidate in candidates:
             if candidate is None:
@@ -1642,6 +1657,12 @@ class RecorderController:
 
     def has_recent_focus(self, max_age_seconds: float = 8.0) -> bool:
         return self._recent_focus_target(max_age_seconds=max_age_seconds) is not None
+
+    def has_start_focus_target(self) -> bool:
+        with self._lock:
+            return has_focus_target_identity(self._focus_target) or has_focus_target_identity(
+                self._focus_target_at_start
+            )
 
     def last_transcript(self) -> str:
         return self._last_transcript
@@ -2020,7 +2041,7 @@ class RecorderController:
         focus_target: FocusTarget | None,
         focus_target_at_start_hint: FocusTarget | None = None,
     ) -> tuple[bool, str]:
-        cached_focus_for_start = self._recent_focus_target(max_age_seconds=5.0) if capture_focus else None
+        cached_focus_for_start = self._recent_focus_target(max_age_seconds=0.75) if capture_focus else None
         captured_focus_for_memory: FocusTarget | None = None
         used_recent_focus_cache = False
         with self._lock:
@@ -2036,6 +2057,10 @@ class RecorderController:
 
             if shutil.which("sox") is None:
                 return False, "SoX is not installed or not in PATH"
+
+            input_error = audio_input_preflight_error(self.config)
+            if input_error:
+                return False, input_error
 
             preflight_error = self._transcriber_preflight_error()
             if preflight_error:
@@ -2123,7 +2148,6 @@ class RecorderController:
             )
         elif self._focus_target is None and self._focus_target_at_start is None:
             log_routing("start_recording: no focus target captured for hotkey flow")
-            threading.Thread(target=self._refresh_focus_target_soon, daemon=True).start()
         elif self._focus_target is None and self._focus_target_at_start is not None:
             log_routing(
                 "start_recording: using focus hint "
@@ -2283,13 +2307,20 @@ class RecorderController:
 
     def _watch_sox_process(self) -> None:
         process: subprocess.Popen[str] | None
+        started_at: float
         with self._lock:
             process = self._process
+            started_at = self._started_at
 
         if process is None:
             return
 
-        process.wait()
+        rc = process.wait()
+        stderr = ""
+        try:
+            stderr = (process.stderr.read() if process.stderr else "") or ""
+        except Exception:
+            stderr = ""
 
         with self._lock:
             # If recording is already false, this was an expected manual stop.
@@ -2298,8 +2329,19 @@ class RecorderController:
             self._recording = False
             self._process = None
 
-        self._emit_state(False, "limit_or_error")
-        self._finish_transcription("limit_reached")
+        max_seconds = self._configured_max_seconds()
+        elapsed = max(0.0, time.time() - started_at)
+        if rc == 0 and max_seconds > 0 and elapsed >= max_seconds - 1.0:
+            with self._lock:
+                self._transcribing = True
+            self._emit_state(False, "limit_reached")
+            self._finish_transcription("limit_reached")
+            return
+
+        detail = stderr.strip().splitlines()[-1] if stderr.strip() else f"sox exited rc={rc}"
+        log_routing(f"recording_error: {detail}")
+        notify("Voice typing", f"Recording stopped: {detail}", urgency="critical")
+        self._emit_state(False, "recording_error")
 
     def _record_chunk_loop(self) -> None:
         queue_ref = self._chunk_queue
@@ -3126,16 +3168,6 @@ class RecorderController:
                     )
                     self._remember_focus_target(resolved)
 
-        if self._capture_focus and self._focus_target is None and self._focus_target_at_start is None:
-            cached = self._recent_focus_target(max_age_seconds=8.0)
-            if cached is not None:
-                self._focus_target = cached
-                self._focus_target_at_start = cached
-                log_routing(
-                    "route: recovered start target from focus tracker "
-                    f"app={cached.source_app!r} pid={cached.source_pid}"
-                )
-
         if (
             self._capture_focus
             and self._focus_target is None
@@ -3239,7 +3271,12 @@ class RecorderController:
                 self._last_route_note = "Focus changed and clipboard copy failed."
                 return "gui_only"
         elif self._capture_focus:
-            log_routing("route: no usable start-focus lock available; using best-effort delivery")
+            if copy_to_clipboard(text):
+                self._last_route_note = "No reliable start text box was captured; transcript copied to clipboard."
+                log_routing("route: clipboard_only (no usable start-focus lock)")
+                return "clipboard_only"
+            self._last_route_note = "No reliable start text box was captured and clipboard copy failed."
+            return "gui_only"
 
         current_focus: FocusTarget | None = None
         if self._capture_focus:
@@ -3257,7 +3294,7 @@ class RecorderController:
             if current_focus is None:
                 current_focus = capture_focus_target_for_hotkey(retries=2, delay_s=0.02)
                 self._remember_focus_target(current_focus)
-            paste_target = current_focus or self._recent_focus_target(max_age_seconds=8.0)
+            paste_target = current_focus or self._recent_focus_target(max_age_seconds=1.0)
             if current_focus is not None and current_focus.source_pid == os.getpid():
                 # Never paste into our own window; keep clipboard fallback instead.
                 if copy_to_clipboard(text):
@@ -3286,7 +3323,7 @@ class RecorderController:
 
         if copy_to_clipboard(text):
             if bool(self.config.get("auto_paste_current_focus", False)) and paste_current_focus_via_ydotool(
-                target=capture_focus_target() or self._recent_focus_target(max_age_seconds=8.0)
+                target=capture_focus_target() or self._recent_focus_target(max_age_seconds=1.0)
             ):
                 log_routing("route: clipboard+pasted success (auto_paste_current_focus)")
                 return "clipboard+pasted"
@@ -3383,7 +3420,7 @@ class IpcServer(threading.Thread):
         def ensure_focus_hint() -> dict[str, Any] | None:
             if focus_hint is not None:
                 return focus_hint
-            cached = self.controller.recent_focus_hint(max_age_seconds=10.0)
+            cached = self.controller.recent_focus_hint(max_age_seconds=0.75)
             if cached is not None:
                 log_routing(
                     "ipc: using cached focus hint "
@@ -3422,7 +3459,7 @@ class IpcServer(threading.Thread):
                 and self.on_show is not None
                 and bool(self.config.get("show_panel_on_hotkey_start", True))
             ):
-                if self.controller.has_recent_focus(max_age_seconds=4.0):
+                if self.controller.has_start_focus_target():
                     self.on_show(False)
                 else:
                     log_routing("ui: skipped panel show on hotkey start (no reliable focus target)")
@@ -3443,7 +3480,7 @@ class IpcServer(threading.Thread):
                 and self.on_show is not None
                 and bool(self.config.get("show_panel_on_hotkey_start", True))
             ):
-                if self.controller.has_recent_focus(max_age_seconds=4.0):
+                if self.controller.has_start_focus_target():
                     self.on_show(False)
                 else:
                     log_routing("ui: skipped panel show on hotkey start (no reliable focus target)")
@@ -3679,6 +3716,12 @@ class VoiceTypingGui:
 
         self.toggle_btn = ttk.Button(self.status_bar, text="Record", style="VT.TButton", command=self._toggle_from_gui)
         self.toggle_btn.pack(side="right")
+        ttk.Button(self.status_bar, text="Settings", style="VT.TButton", command=self._toggle_settings).pack(
+            side="right", padx=(0, 6)
+        )
+        ttk.Button(self.status_bar, text="Stop", style="VT.TButton", command=self._stop_from_gui).pack(
+            side="right", padx=(0, 6)
+        )
 
         mode_row = ttk.Frame(root_pad, style="VT.Root.TFrame")
         mode_row.pack(fill="x", pady=(6, 0))
@@ -3751,7 +3794,9 @@ class VoiceTypingGui:
         self.transcript_box.pack(fill="both", expand=True, pady=(4, 0))
         self.transcript_box.configure(state="disabled")
 
-        options_frame = ttk.Frame(root_pad, style="VT.Card.TFrame", padding=(8, 8))
+        self.options_visible = False
+        self.options_frame = ttk.Frame(root_pad, style="VT.Card.TFrame", padding=(8, 8))
+        options_frame = self.options_frame
         options_frame.pack(fill="x")
 
         engine_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
@@ -3889,9 +3934,17 @@ class VoiceTypingGui:
         ttk.Button(bottom, text="Model Help", style="VT.Detail.TButton", command=self._show_model_help).pack(
             side="right"
         )
+        self.options_frame.pack_forget()
 
         self._refresh_models()
         self._refresh_ollama_models()
+
+    def _toggle_settings(self) -> None:
+        self.options_visible = not self.options_visible
+        if self.options_visible:
+            self.options_frame.pack(fill="x")
+        else:
+            self.options_frame.pack_forget()
 
     def _refresh_ollama_models(self) -> None:
         def _fetch() -> None:
@@ -4077,8 +4130,10 @@ class VoiceTypingGui:
                     self.status_var.set("Idle")
                     self._set_visual_state("idle")
                     self.toggle_btn.configure(text="Record")
-                    if reason == "limit_or_error":
+                    if reason in {"limit_or_error", "limit_reached"}:
                         self.status_var.set("Stopped (limit reached)")
+                    elif reason == "recording_error":
+                        self.status_var.set("Stopped (recording error)")
                 self._apply_window_presentation()
 
             if event == "audio_quality":
@@ -4191,7 +4246,7 @@ class VoiceTypingGui:
         """Push compositor focus back to the original target right after GUI show."""
         target = self.controller._focus_target or self.controller._focus_target_at_start
         if target is None:
-            target = self.controller._recent_focus_target(max_age_seconds=5.0)
+            target = self.controller._recent_focus_target(max_age_seconds=1.0)
         if target is not None and target.source_pid is not None and target.source_pid != os.getpid():
             activate_window_by_pid(target.source_pid)
 
@@ -4208,7 +4263,7 @@ class VoiceTypingGui:
 
     def _restore_external_focus_after_hotkey_show(self) -> None:
         try:
-            self.controller.restore_last_external_focus(max_age_seconds=10.0)
+            self.controller.restore_last_external_focus(max_age_seconds=1.0)
         except Exception:
             pass
 
@@ -4413,6 +4468,16 @@ def cmd_status() -> int:
 def cmd_start() -> int:
     resp = send_ipc_with_retries({"cmd": "start"}, attempts=1, timeout=0.45)
     if resp is None:
+        if os.path.exists(SOCKET_PATH):
+            _, err = send_ipc_raw({"cmd": "status"}, timeout=1.0)
+            if isinstance(err, socket.timeout):
+                print("Voice typing controller is busy, try again")
+                return 1
+            if isinstance(err, ConnectionRefusedError):
+                try:
+                    os.unlink(SOCKET_PATH)
+                except Exception:
+                    pass
         lock_file = _acquire_spawn_lock(timeout_seconds=1.5)
         if lock_file is None:
             print("Voice typing is already starting, try again")
