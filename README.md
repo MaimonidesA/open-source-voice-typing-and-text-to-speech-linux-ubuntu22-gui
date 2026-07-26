@@ -61,6 +61,7 @@ git clone https://github.com/ggml-org/whisper.cpp ~/whisper.cpp
 cd ~/whisper.cpp
 ./models/download-ggml-model.sh small.en      # the model in use: ggml-small.en.bin
 ./models/download-ggml-model.sh base.en       # optional, faster/lighter
+./models/download-ggml-model.sh small         # multilingual: Hebrew/French/Italian/etc.
 ```
 
 **CUDA build (used on this machine, `whisper_cli_path: ~/whisper.cpp/build-cuda/bin/whisper-cli`)** — runs on the RTX GPU and falls back to CPU automatically if CUDA is unavailable. Existing configs that still point at the old default `~/whisper.cpp/build/bin/whisper-cli` are promoted to this CUDA binary on startup when it exists. Requires the CUDA toolkit (installed here at `/usr/local/cuda`); cap build parallelism — an unrestricted `-j` CUDA compile can OOM the machine:
@@ -82,7 +83,14 @@ ollama pull gemma4                              # = gemma4:e4b, the model in use
 Notes:
 - Upgrading Ollama never requires changes to this app (it uses the stable HTTP API on `127.0.0.1:11434`), and downloaded models survive upgrades.
 - `ollama pull gemma4:12b` requires a newer Ollama than 0.21 (you get HTTP 412 otherwise) — upgrade first with the same install script.
-- VRAM guide for model choice: `e2b` fits an 8 GB GPU; `e4b` (~10 GB loaded) and `12b` fall back to CPU on this laptop — they work, just slower.
+- VRAM guide for model choice: `gemma4:e4b-it-qat` is the safer full-GPU option on an 8 GB card; `gemma4:12b-it-qat` can run with partial CPU offload and benefits from a smaller context.
+
+The Voice Typing and Reader Settings panels expose **Ollama context tokens**
+(`num_ctx`). This controls how much context Ollama reserves and therefore how
+much VRAM is needed; it is separate from the output-token limit. For an 8 GB
+GPU, start at `2048`, then try `4096` if the model remains stable. Text and
+translation requests use Ollama's native chat API so this setting is applied to
+the model request.
 
 ### 5. Piper TTS (bundled — nothing to install)
 
@@ -109,7 +117,7 @@ python3 -m pip install torch accelerate transformers soundfile
 
 ```bash
 cd /home/yaronbayrobee/Voice_typing
-chmod +x voice_typing.py voice-toggle voice_reading.py voice-read
+chmod +x voice_typing.py voice-toggle voice_reading.py voice-read voice-translate
 ./voice_typing.py doctor     # checks sox, wl-copy, ydotool, whisper-cli, model, ollama
 ./voice_typing.py gui
 ```
@@ -135,8 +143,12 @@ Settings → Keyboard → Custom Shortcuts:
 |----------|---------|
 | `Win+H` | `/home/yaronbayrobee/Voice_typing/voice-toggle` |
 | `Super+R` | `/home/yaronbayrobee/Voice_typing/voice-read` |
+| `Super+Shift+T` | `/home/yaronbayrobee/Voice_typing/voice-translate` |
 
-If the GUI is already running the hotkey toggles it; if not, the first press launches it and starts recording/reading.
+If the GUI is already running the hotkey toggles it or starts translation; if not,
+the first press launches it and starts recording, reading, or translating. The
+Reader Translation panel has a **Cancel** button that closes the active Ollama
+stream. Starting a new translation also cancels the previous one.
 
 ## File and data paths
 
@@ -187,6 +199,11 @@ or click **Retry Last Audio** in the GUI. Whisper transcription timeouts scale w
 ./voice_typing.py set-model ggml-small.en.bin
 ```
 
+For Hebrew, French, Italian, or mixed-language dictation, use the GUI's
+`Speech language: auto` setting and a multilingual model such as
+`ggml-small.bin` (the `.en` models are English-only). Gemma transcription is
+also instructed to preserve the original language and Unicode script.
+
 **Ollama / Gemma models** — pull with Ollama, then the Ollama dropdown (**Refresh** to re-scan), or:
 
 ```bash
@@ -196,14 +213,51 @@ ollama pull gemma4:12b
 
 The selected Ollama model is used for both gemma-agent transcription and ask-gemma answers.
 
-**Reader voices (Piper, British)** — the **Get GB Voices** button in the reader GUI, or:
+Speech-to-text does not translate by default. In the Voice Typing top bar, enable
+**Translate**, choose English/Hebrew/French/Italian, and optionally enable
+**Speak**. When Translate is enabled, every take uses multilingual Whisper for
+the original spoken language, sends the completed transcript to the selected
+Ollama/Gemma model, and routes the translated text to the original target field
+and clipboard. When Speak is enabled, the translated text is sent to the
+language-aware Voice Reading process, which selects the target-language voice.
+The **Translate take** button remains available for a one-shot translation even
+when the Translate checkbox is off. Translation takes wait for the complete
+Whisper transcript so untranslated partials are never pasted.
+
+**Reader voices (Piper)** — the **Get Voices** button in the reader GUI, or:
 
 ```bash
 ./voice_reading.py list-gb-voices
 ./voice_reading.py download-voice en_GB-jenny_dioco-medium
+./voice_reading.py translate       # translate the current selection in the Reader GUI
 ```
 
 then **Refresh Models** and pick the voice in the Model dropdown. Voices land in `piper_voices/`; the reader also scans `~/.local/share/piper[/voices]`, `~/.cache/piper`, `/usr/share/piper[-voices]`, `/opt/piper/voices`.
+
+The bundled Piper index includes French (`fr_FR`) and Italian (`it_IT`) voices as
+well as English. The downloader also adds the Hebrew `he_IL-phonikud-medium`
+voice, which downloads a Piper-compatible Hebrew checkpoint and its Phonikud
+phonemizer. Install the optional Python adapter first with
+`python3 -m pip install -r requirements-hebrew-tts.txt`; then open **Get
+Voices**, select the Hebrew row, and click **Download Selected**. The Hebrew
+download is about 364 MB and is kept under `piper_voices/he/`.
+The Reader selects default voices by language when installed: English
+`en_GB-cori-high`, French `fr_FR-upmc-medium`, and Italian
+`it_IT-paola-medium`, and Hebrew `he_IL-phonikud-medium`. The downloader marks
+these recommendations; download a default once if it is not installed.
+
+**Reader translation** — select text, open the Reader panel, choose English,
+Hebrew, French, or Italian, and press **Translate**. The text is sent only to
+the configured local Ollama/Gemma server and the result appears as text in the
+Translation panel. **Copy Translation** puts it on the clipboard. The Reader
+also has a **Speak** option for reading the translated result aloud.
+
+Voice Typing and Voice Reading are separate windows but use the same local
+Ollama API. They keep separate model settings intentionally. In the Reader's
+Settings, use **Translation Model** and **Refresh Models** to choose any model
+installed in Ollama, such as `gemma4:latest` or `gemma4:12b-it-qat`. The active
+model is logged for every translation request. A larger model may improve
+translation quality, but it is not inherently faster and uses more VRAM.
 
 **Spoken-answer voice (ask-gemma)** — follows the reader's chosen Piper voice automatically; override with the `answer_voice_model` config key (path to an `.onnx`).
 
@@ -231,9 +285,11 @@ Full reference with defaults: [config.example.json](config.example.json). Highli
 - `audio_input_device` — empty/default uses the desktop default mic; set with `./voice_typing.py list-audio-inputs` and `./voice_typing.py set-audio-input ...`.
 - `save_recordings` (true) / `recordings_dir` / `recordings_keep` (30) — the archive.
 - `streaming_transcription` + `streaming_chunk_seconds` — rolling chunks while talking (Gemma is clamped to ≤30 s).
-- `ollama_model`, `ollama_url`, `ollama_keep_alive` (30m, keeps the model warm), `ollama_max_tokens`, `ollama_disable_thinking` (true — **important**: gemma4 otherwise burns its whole token budget on hidden reasoning and returns nothing), `ollama_normalize_audio` (true — Gemma needs louder input than Whisper), `ollama_frequency_penalty` (0.5 — damps repetition loops).
+- `ollama_model`, `ollama_url`, `ollama_keep_alive` (30m, keeps the model warm), `ollama_context_tokens` (`num_ctx`, default 2048), `ollama_max_tokens`, `ollama_disable_thinking` (true — **important**: gemma4 otherwise burns its whole token budget on hidden reasoning and returns nothing), `ollama_normalize_audio` (true — Gemma needs louder input than Whisper), `ollama_frequency_penalty` (0.5 — damps repetition loops).
 - `assistant_answer_mode` — the ask-gemma switch; `answer_speak_aloud` (true), `answer_voice_model`, `ollama_ask_system_prompt`, `ollama_answer_max_tokens` (600).
-- `auto_paste_current_focus`, `paste_fallback_for_hotkey`, `restore_clipboard_after_paste`, `copy_to_clipboard_when_started_from_gui` — routing behavior.
+- `language` (`auto`, `en`, `he`, `fr`, `it`) and `always_copy_hotkey_to_clipboard` — multilingual transcription and guaranteed clipboard recovery for hotkey takes.
+- `auto_paste_current_focus`, `paste_fallback_for_hotkey`, `restore_clipboard_after_paste`, `copy_to_clipboard_when_started_from_gui`, `window_always_on_top` — routing/window behavior. The panel is not always-on-top by default so it cannot steal the target field's focus.
+- Hotkey delivery uses full clipboard paste first. `direct_type_max_chars_for_hotkey` defaults to `0` so long transcripts are never truncated by simulated keyboard typing; set a small positive value only if a target application cannot paste.
 - `voice_commands_enabled`, `assistant_wake_mode`, `assistant_wake_phrases` — wake-word/assistant extras.
 
 ## Troubleshooting

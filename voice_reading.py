@@ -23,6 +23,8 @@ import sys
 import threading
 import time
 import tempfile
+import urllib.error
+import urllib.request
 import wave
 from pathlib import Path
 from typing import Any, Callable
@@ -74,12 +76,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "rate": 0,  # speech-dispatcher scale: -100..100
     "pitch": 0,
     "language": "en",
+    "ollama_url": "http://127.0.0.1:11434",
+    "ollama_model": "gemma4:latest",
+    "ollama_context_tokens": 2048,
+    "ollama_timeout_seconds": 300,
+    "ollama_keep_alive": "30m",
+    "translation_target_language": "English",
+    "translation_speak_aloud": False,
     "voice": "",
     "voice_type": "male1",
     "prefer_primary_selection": True,
     "capture_selected_text_via_copy": True,
     "show_panel_on_hotkey": True,
-    "window_always_on_top": True,
+    "window_always_on_top": False,
     "window_opacity": 0.95,
     "ultra_precise_highlight_sync": False,
     "reading_preprocess_mode": "off",
@@ -151,6 +160,11 @@ class ConfigManager:
             loaded = {}
         data = dict(DEFAULT_CONFIG)
         data.update(loaded if isinstance(loaded, dict) else {})
+        if isinstance(loaded, dict) and "window_always_on_top" in loaded and not loaded.get(
+            "focus_safe_migration_v1", False
+        ):
+            data["window_always_on_top"] = False
+            data["focus_safe_migration_v1"] = True
         # Sanitize bad/legacy placeholder values.
         module = str(data.get("output_module", "")).strip()
         if module.upper() in {"OUTPUT", "MODULE", "MODULES"}:
@@ -718,6 +732,38 @@ def list_piper_model_paths() -> list[str]:
     return found
 
 
+def list_ollama_models(base_url: str) -> list[str]:
+    """Return locally installed Ollama model names for the Reader selector."""
+    url = f"{base_url.rstrip('/')}/api/tags"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=2.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        log_line(f"ollama model list failed: {exc}")
+        return []
+    models = payload.get("models", []) if isinstance(payload, dict) else []
+    names = {
+        str(item.get("name", "")).strip()
+        for item in models
+        if isinstance(item, dict) and str(item.get("name", "")).strip()
+    }
+    return sorted(names, key=str.casefold)
+
+
+def ollama_generation_options(config: "ConfigManager", output_tokens: int | None = None) -> dict[str, Any]:
+    """Build native Ollama options, including the VRAM-sensitive context size."""
+    try:
+        context_tokens = int(config.get("ollama_context_tokens", 2048))
+    except (TypeError, ValueError):
+        context_tokens = 2048
+    context_tokens = max(512, min(262144, context_tokens))
+    options: dict[str, Any] = {"num_ctx": context_tokens}
+    if output_tokens is not None:
+        options["num_predict"] = max(1, int(output_tokens))
+    return options
+
+
 def format_piper_model_label(path_str: str) -> str:
     path = Path(path_str)
     base = path.stem
@@ -725,6 +771,60 @@ def format_piper_model_label(path_str: str) -> str:
     if parent and parent != ".":
         return f"{base} ({parent})"
     return base
+
+
+LANGUAGE_FAMILIES = {
+    "english": "en",
+    "en": "en",
+    "french": "fr",
+    "fr": "fr",
+    "italian": "it",
+    "it": "it",
+    "hebrew": "he",
+    "he": "he",
+}
+
+DEFAULT_PIPER_VOICE_KEYS = {
+    "en": "en_GB-cori-high",
+    "fr": "fr_FR-upmc-medium",
+    "it": "it_IT-paola-medium",
+    "he": "he_IL-phonikud-medium",
+}
+
+
+def normalize_language_family(language: str) -> str:
+    raw = language.strip().lower().replace("-", "_")
+    return LANGUAGE_FAMILIES.get(raw, raw.split("_", 1)[0])
+
+
+def piper_model_family(path_str: str) -> str:
+    match = re.search(r"(?:^|[/_\\-])([a-z]{2})(?:[_\\-]|$)", path_str.lower())
+    return match.group(1) if match else ""
+
+
+def choose_piper_model_for_language(model_paths: list[str], language: str) -> str:
+    """Choose the best installed Piper voice matching a language family."""
+    family = normalize_language_family(language)
+    candidates = [path for path in model_paths if piper_model_family(path) == family]
+    if not candidates:
+        return ""
+    preferred_key = DEFAULT_PIPER_VOICE_KEYS.get(family, "")
+    if preferred_key:
+        preferred = [path for path in candidates if preferred_key.lower() in Path(path).name.lower()]
+        if preferred:
+            return preferred[0]
+    quality_rank = {"high": 0, "medium": 1, "low": 2, "x_low": 3}
+    candidates.sort(
+        key=lambda path: (
+            quality_rank.get(Path(path).stem.rsplit("-", 1)[-1].lower(), 9),
+            Path(path).name.lower(),
+        )
+    )
+    return candidates[0]
+
+
+def piper_model_matches_language(path_str: str, language: str) -> bool:
+    return bool(path_str) and piper_model_family(path_str) == normalize_language_family(language)
 
 
 def list_audio_player_commands(wav_path: str) -> list[list[str]]:
@@ -768,16 +868,52 @@ PIPER_VOICES_BASE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/mai
 PIPER_VOICES_INDEX = SCRIPT_DIR / "piper_voices" / "index" / "voices.json"
 PIPER_DOWNLOAD_DIR = SCRIPT_DIR / "piper_voices"
 
+# Piper's upstream catalog still has no Hebrew voice.  This checkpoint is
+# published by the Phonikud project in Piper's ONNX + JSON format.  It takes
+# IPA, so the companion Phonikud ONNX G2P model is downloaded with it and used
+# by the reader before invoking Piper.
+HEBREW_PIPER_ENTRY: dict[str, Any] = {
+    "key": "he_IL-phonikud-medium",
+    "language": "he_IL",
+    "language_family": "he",
+    "language_name": "Hebrew",
+    "language_native": "עברית",
+    "country": "Israel",
+    "speaker": "Phonikud",
+    "num_speakers": 1,
+    "is_default": True,
+    "quality": "medium",
+    "size_mb": 364,
+    "onnx": "he/he_IL/phonikud/medium/he_IL-phonikud-medium.onnx",
+    "json": "he/he_IL/phonikud/medium/he_IL-phonikud-medium.onnx.json",
+    "source_base_url": "https://huggingface.co/Phonikud/phonikud-tts-checkpoints/resolve/main",
+    "onnx_source": "model.onnx",
+    "json_source": "model.config.json",
+    "extra_files": [
+        {
+            "url": "https://huggingface.co/thewh1teagle/phonikud-onnx/resolve/main/phonikud-1.0.int8.onnx",
+            "path": "he/phonikud-1.0.int8.onnx",
+        }
+    ],
+}
 
-def list_gb_voice_catalog() -> list[dict[str, Any]]:
-    """British (en_GB) Piper voices from the bundled index, with install state."""
+
+def _voice_entry_installed(entry: dict[str, Any]) -> bool:
+    paths = [entry["onnx"], entry["json"]]
+    paths.extend(str(item["path"]) for item in entry.get("extra_files", []) if isinstance(item, dict))
+    return all((PIPER_DOWNLOAD_DIR / path).exists() for path in paths)
+
+
+def list_voice_catalog(locales: set[str] | None = None) -> list[dict[str, Any]]:
+    """Piper voices from the bundled index plus the supported Hebrew voice."""
     try:
         data = json.loads(PIPER_VOICES_INDEX.read_text(encoding="utf-8"))
     except Exception:
         return []
     catalog: list[dict[str, Any]] = []
     for key, info in sorted(data.items()):
-        if not key.startswith("en_GB"):
+        language = str(info.get("language", {}).get("code", "")) if isinstance(info, dict) else ""
+        if locales and language not in locales:
             continue
         files = info.get("files", {}) if isinstance(info, dict) else {}
         onnx_files = [name for name in files if name.endswith(".onnx")]
@@ -788,29 +924,58 @@ def list_gb_voice_catalog() -> list[dict[str, Any]]:
         catalog.append(
             {
                 "key": key,
+                "language": language,
+                "language_family": str(info.get("language", {}).get("family", "")),
+                "language_name": str(info.get("language", {}).get("name_english", language)),
+                "language_native": str(info.get("language", {}).get("name_native", "")),
+                "country": str(info.get("language", {}).get("country_english", "")),
+                "speaker": str(info.get("name", key)),
+                "num_speakers": int(info.get("num_speakers", 1) or 1),
+                "is_default": key == DEFAULT_PIPER_VOICE_KEYS.get(
+                    str(info.get("language", {}).get("family", "")), ""
+                ),
                 "quality": str(info.get("quality", "")),
                 "size_mb": size_mb,
                 "onnx": rel_onnx,
                 "json": rel_onnx + ".json",
-                "installed": (PIPER_DOWNLOAD_DIR / rel_onnx).exists(),
+                "installed": _voice_entry_installed({"onnx": rel_onnx, "json": rel_onnx + ".json"}),
             }
         )
+    if not locales or HEBREW_PIPER_ENTRY["language"] in locales:
+        hebrew = dict(HEBREW_PIPER_ENTRY)
+        hebrew["installed"] = _voice_entry_installed(hebrew)
+        catalog.append(hebrew)
+    catalog.sort(key=lambda item: (str(item.get("language_name", "")).casefold(), str(item.get("key", "")).casefold()))
     return catalog
 
 
-def download_piper_voice(key: str, progress: Callable[[str], None] | None = None) -> tuple[bool, str]:
-    """Fetch a voice (.onnx + .onnx.json) from rhasspy/piper-voices on
-    Hugging Face into the repo's piper_voices directory."""
-    import urllib.request
+def list_gb_voice_catalog() -> list[dict[str, Any]]:
+    """Backward-compatible British voice catalog."""
+    return list_voice_catalog({"en_GB"})
 
-    entry = next((item for item in list_gb_voice_catalog() if item["key"] == key), None)
+
+def download_piper_voice(key: str, progress: Callable[[str], None] | None = None) -> tuple[bool, str]:
+    """Fetch a voice and any required phonemizer files into piper_voices."""
+    entry = next((item for item in list_voice_catalog() if item["key"] == key), None)
     if entry is None:
         return False, f"Unknown voice: {key} (see list-gb-voices)"
     if entry["installed"]:
         return True, f"{key} is already installed"
 
-    for rel_path in (entry["onnx"], entry["json"]):
-        url = f"{PIPER_VOICES_BASE_URL}/{rel_path}"
+    files_to_download = [
+        {
+            "url": f"{entry.get('source_base_url', PIPER_VOICES_BASE_URL).rstrip('/')}/{entry.get('onnx_source', entry['onnx'])}",
+            "path": entry["onnx"],
+        },
+        {
+            "url": f"{entry.get('source_base_url', PIPER_VOICES_BASE_URL).rstrip('/')}/{entry.get('json_source', entry['json'])}",
+            "path": entry["json"],
+        },
+    ]
+    files_to_download.extend(entry.get("extra_files", []))
+    for file_info in files_to_download:
+        rel_path = str(file_info["path"])
+        url = str(file_info["url"])
         dest = PIPER_DOWNLOAD_DIR / rel_path
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.with_suffix(dest.suffix + ".part")
@@ -834,6 +999,38 @@ def download_piper_voice(key: str, progress: Callable[[str], None] | None = None
     return True, f"Installed {key} ({entry['size_mb']} MB). Click Refresh Models to use it."
 
 
+_HEBREW_PHONEMIZER: Any = None
+_HEBREW_PHONEMIZER_LOCK = threading.Lock()
+
+
+def prepare_piper_text(text: str, model_path: str) -> tuple[str, str]:
+    """Return Piper input and an optional preparation error.
+
+    The Phonikud Piper checkpoint consumes IPA rather than Hebrew graphemes.
+    Keep the dependency optional for users who only use the other Piper
+    voices, but fail clearly instead of sending unsupported Hebrew characters
+    to Piper when the Hebrew voice is selected.
+    """
+    if normalize_language_family(piper_model_family(model_path)) != "he":
+        return text, ""
+    phonemizer_path = PIPER_DOWNLOAD_DIR / "he" / "phonikud-1.0.int8.onnx"
+    if not phonemizer_path.exists():
+        return "", "Hebrew voice phonemizer is not installed; download the Hebrew voice again."
+    try:
+        from phonikud_tts import Phonikud, phonemize
+    except Exception as exc:
+        return "", f"Hebrew voice needs phonikud-tts (install requirements-hebrew-tts.txt): {exc}"
+    global _HEBREW_PHONEMIZER
+    try:
+        with _HEBREW_PHONEMIZER_LOCK:
+            if _HEBREW_PHONEMIZER is None:
+                _HEBREW_PHONEMIZER = Phonikud(str(phonemizer_path))
+            with_diacritics = _HEBREW_PHONEMIZER.add_diacritics(text)
+        return phonemize(with_diacritics), ""
+    except Exception as exc:
+        return "", f"Hebrew text preparation failed: {exc}"
+
+
 class ReaderController:
     def __init__(
         self,
@@ -841,11 +1038,13 @@ class ReaderController:
         on_state_change: Callable[[bool, str], None] | None = None,
         on_text: Callable[[str, str], None] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        on_translation: Callable[[str, str, str], None] | None = None,
     ) -> None:
         self.config = config
         self.on_state_change = on_state_change
         self.on_text = on_text
         self.on_progress = on_progress
+        self.on_translation = on_translation
         self._lock = threading.Lock()
         self._speaking = False
         self._proc: subprocess.Popen[str] | None = None
@@ -861,6 +1060,12 @@ class ReaderController:
         self._progress_stop = threading.Event()
         self._progress_thread: threading.Thread | None = None
         self._run_id = 0
+        self._last_text = ""
+        self._last_translation = ""
+        self._translation_lock = threading.Lock()
+        self._translation_id = 0
+        self._translation_cancel: threading.Event | None = None
+        self._translation_response: Any | None = None
 
     def is_speaking(self) -> bool:
         with self._lock:
@@ -877,6 +1082,7 @@ class ReaderController:
         text, source = get_selected_text(self.config)
         if not text:
             return False, "No selected text found"
+        self._last_text = text.strip()
         preprocess_mode = resolve_preprocess_mode(self.config)
         processed, changed, mode_used = preprocess_text_for_mode(text, preprocess_mode)
         speak_text = processed if processed else text
@@ -899,6 +1105,229 @@ class ReaderController:
         if words:
             self._emit_progress(0, len(words))
         return self._start_async(speak_text, start_word_index=0)
+
+    def translate_selection_async(self, target_language: str, speak_aloud: bool = False) -> tuple[bool, str]:
+        """Translate the last captured/selected text using the local Ollama model."""
+        target_language = target_language.strip()
+        if not target_language:
+            return False, "Choose a target language first"
+        text = self._last_text.strip()
+        source = "last selection"
+        if not text:
+            text, source = get_selected_text(self.config)
+            text = text.strip()
+        if not text:
+            return False, "No selected text found"
+        self._last_text = text
+        previous_active = False
+        with self._translation_lock:
+            previous_event = self._translation_cancel
+            previous_response = self._translation_response
+            if previous_event is not None:
+                previous_active = True
+                previous_event.set()
+            if previous_response is not None:
+                try:
+                    previous_response.close()
+                except Exception:
+                    pass
+            self._translation_id += 1
+            request_id = self._translation_id
+            cancel_event = threading.Event()
+            self._translation_cancel = cancel_event
+            self._translation_response = None
+        log_line(
+            f"translation start target={target_language!r} chars={len(text)} model={self.config.get('ollama_model', 'gemma4:latest')!r}"
+        )
+
+        def _work() -> None:
+            try:
+                translated, error = self._translate_with_ollama(
+                    text,
+                    target_language,
+                    cancel_event=cancel_event,
+                    request_id=request_id,
+                )
+                if not self._translation_is_current(request_id, cancel_event):
+                    return
+                if error:
+                    log_line(f"translation failed target={target_language!r}: {error}")
+                    self._emit_translation("", target_language, error)
+                    return
+                self._last_translation = translated
+                log_line(f"translation success target={target_language!r} chars={len(translated)}")
+                self._emit_translation(translated, target_language, source)
+                if speak_aloud:
+                    self.speak_text_async(translated, language=target_language)
+            finally:
+                with self._translation_lock:
+                    if self._translation_id == request_id and self._translation_cancel is cancel_event:
+                        self._translation_cancel = None
+
+        threading.Thread(target=_work, daemon=True).start()
+        if previous_active:
+            return True, f"Previous translation cancelled; translating to {target_language}..."
+        return True, f"Translating to {target_language}..."
+
+    def cancel_translation(self) -> tuple[bool, str]:
+        """Cancel the active Ollama translation and close its HTTP stream."""
+        with self._translation_lock:
+            cancel_event = self._translation_cancel
+            response = self._translation_response
+        if cancel_event is None:
+            return False, "No translation is running"
+        cancel_event.set()
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        log_line("translation cancellation requested")
+        return True, "Translation cancellation requested"
+
+    def _translation_is_current(self, request_id: int, cancel_event: threading.Event) -> bool:
+        with self._translation_lock:
+            return (
+                request_id == self._translation_id
+                and self._translation_cancel is cancel_event
+                and not cancel_event.is_set()
+            )
+
+    def _translate_with_ollama(
+        self,
+        text: str,
+        target_language: str,
+        *,
+        cancel_event: threading.Event | None = None,
+        request_id: int | None = None,
+    ) -> tuple[str, str | None]:
+        payload = {
+            "model": str(self.config.get("ollama_model", "gemma4:latest")),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise translator. Detect the source language and translate "
+                        f"the text into {target_language}. Output only the translation, with no "
+                        "explanation, labels, quotes, markdown, or transliteration. Preserve "
+                        "paragraph breaks, names, numbers, punctuation, and Unicode scripts."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            "stream": True,
+            "options": {
+                **ollama_generation_options(self.config, max(256, min(4096, len(text) * 4))),
+                "temperature": 0.1,
+            },
+            # Gemma4 can spend the whole response in its hidden reasoning
+            # channel. Translation needs the visible answer only.
+            "think": False,
+        }
+        payload["keep_alive"] = str(self.config.get("ollama_keep_alive", "30m"))
+        timeout = int(self.config.get("ollama_timeout_seconds", 300))
+        response: Any | None = None
+        try:
+            req = urllib.request.Request(
+                f"{str(self.config.get('ollama_url', 'http://127.0.0.1:11434')).rstrip('/')}/api/chat",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            response = urllib.request.urlopen(req, timeout=timeout)
+            with self._translation_lock:
+                if (
+                    cancel_event is not None
+                    and request_id is not None
+                    and (
+                        request_id != self._translation_id
+                        or self._translation_cancel is not cancel_event
+                        or cancel_event.is_set()
+                    )
+                ):
+                    response.close()
+                    return "", "Translation cancelled"
+                self._translation_response = response
+
+            parts: list[str] = []
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    return "", "Translation cancelled"
+                raw_line = response.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices", []) if isinstance(chunk, dict) else []
+                choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+                delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+                content = delta.get("content", "") if isinstance(delta, dict) else ""
+                if not content and isinstance(choice, dict):
+                    message = choice.get("message", {})
+                    content = message.get("content", "") if isinstance(message, dict) else ""
+                # Native /api/chat streaming responses put the assistant
+                # message at the top level, unlike the OpenAI-compatible
+                # choices[].delta shape.
+                if not content and isinstance(chunk, dict):
+                    message = chunk.get("message", {})
+                    content = message.get("content", "") if isinstance(message, dict) else ""
+                if isinstance(content, list):
+                    content = "".join(
+                        str(item.get("text", "")) for item in content if isinstance(item, dict)
+                    )
+                if content:
+                    parts.append(str(content))
+            result = "".join(parts).strip()
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                detail = str(exc)
+            return "", f"Translation failed: {detail or exc}"
+        except Exception as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                return "", "Translation cancelled"
+            return "", f"Translation failed: {exc}"
+        finally:
+            with self._translation_lock:
+                if self._translation_response is response:
+                    self._translation_response = None
+        if not result:
+            return "", "Gemma returned an empty translation"
+        return result, None
+
+    def speak_text_async(self, text: str, language: str | None = None) -> tuple[bool, str]:
+        """Speak text without recapturing the system selection."""
+        text = text.strip()
+        if not text:
+            return False, "Nothing to speak"
+        if self.is_speaking():
+            self.stop()
+        words = re.findall(r"\S+", text)
+        with self._lock:
+            self._paused = False
+            self._resume_text = ""
+            self._resume_word_index = 0
+            self._full_words = words
+            self._word_total = len(words)
+            self._word_index = 0 if words else -1
+        self._last_source = "translation"
+        self._emit_text(text, "translation")
+        if words:
+            self._emit_progress(0, len(words))
+        return self._start_async(text, start_word_index=0, language_override=language)
+
+    def _emit_translation(self, text: str, target_language: str, meta: str) -> None:
+        if self.on_translation is not None:
+            self.on_translation(text, target_language, meta)
 
     def _terminate_process(self, proc: subprocess.Popen[str] | None) -> None:
         if proc is None or proc.poll() is not None:
@@ -927,7 +1356,12 @@ class ReaderController:
         with self._lock:
             return run_id == self._run_id
 
-    def _start_async(self, text: str, start_word_index: int = 0) -> tuple[bool, str]:
+    def _start_async(
+        self,
+        text: str,
+        start_word_index: int = 0,
+        language_override: str | None = None,
+    ) -> tuple[bool, str]:
         with self._lock:
             if self._speaking:
                 return False, "Already reading"
@@ -938,7 +1372,11 @@ class ReaderController:
             self._cancel_reason = ""
             self._cancel_state_pre_emitted = False
         self._emit_state(True, "reading")
-        threading.Thread(target=self._worker, args=(text, start_word_index, run_id), daemon=True).start()
+        threading.Thread(
+            target=self._worker,
+            args=(text, start_word_index, run_id, language_override),
+            daemon=True,
+        ).start()
         return True, "Reading started"
 
     def stop(self) -> tuple[bool, str]:
@@ -1179,13 +1617,20 @@ class ReaderController:
         except Exception:
             return None
 
-    def _worker(self, text: str, start_word_index: int, run_id: int) -> None:
+    def _worker(
+        self,
+        text: str,
+        start_word_index: int,
+        run_id: int,
+        language_override: str | None = None,
+    ) -> None:
         engine = str(self.config.get("engine", "spd-say")).strip() or "spd-say"
         output_module = str(self.config.get("output_module", "")).strip()
         piper_model = str(self.config.get("piper_model", "")).strip()
         rate = int(self.config.get("rate", 0))
         pitch = int(self.config.get("pitch", 0))
-        language = str(self.config.get("language", "en")).strip()
+        language = str(language_override or self.config.get("language", "en")).strip()
+        speech_language = normalize_language_family(language)
         voice = str(self.config.get("voice", "")).strip()
         voice_type = str(self.config.get("voice_type", "male1")).strip()
         ultra_sync = bool(self.config.get("ultra_precise_highlight_sync", False))
@@ -1203,6 +1648,28 @@ class ReaderController:
         with self._lock:
             total_words = self._word_total
             full_words = list(self._full_words)
+        selected_model = ""
+        if engine == "piper":
+            models = list_piper_model_paths()
+            if piper_model and piper_model_matches_language(piper_model, language):
+                selected_model = piper_model
+            else:
+                selected_model = choose_piper_model_for_language(models, language)
+            if not selected_model:
+                # The bundled Piper catalog has no Hebrew voice. Prefer a
+                # system voice for that language instead of speaking Hebrew
+                # through an English model.
+                if shutil.which("espeak-ng"):
+                    fallback_engine = "espeak-ng"
+                elif shutil.which("espeak"):
+                    fallback_engine = "espeak"
+                else:
+                    fallback_engine = "spd-say"
+                if shutil.which(fallback_engine):
+                    log_line(
+                        f"tts: no Piper voice for language={language!r}; falling back to {fallback_engine}"
+                    )
+                    engine = fallback_engine
         if total_words <= 0:
             full_words = re.findall(r"\S+", text)
             total_words = len(full_words)
@@ -1224,8 +1691,8 @@ class ReaderController:
                 cmd = ["spd-say", "-w", "-r", str(rate), "-p", str(pitch), "-N", "voice-reading", "-n", "main"]
                 if output_module:
                     cmd.extend(["-o", output_module])
-                if language:
-                    cmd.extend(["-l", language])
+                if speech_language:
+                    cmd.extend(["-l", speech_language])
                 if voice_type:
                     cmd.extend(["-t", voice_type])
                 if voice:
@@ -1247,8 +1714,8 @@ class ReaderController:
                 cmd = [engine, "-s", str(wpm), "-p", str(max(0, min(99, 50 + pitch // 2))), "--stdin"]
                 if voice:
                     cmd.extend(["-v", voice])
-                elif language:
-                    cmd.extend(["-v", language])
+                elif speech_language:
+                    cmd.extend(["-v", speech_language])
                 proc = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
@@ -1267,10 +1734,15 @@ class ReaderController:
                     err_text = "Piper engine not found"
                     proc = None
                 else:
-                    models = list_piper_model_paths()
-                    selected_model = piper_model if piper_model and Path(piper_model).exists() else choose_preferred_piper_model(models)
+                    piper_input = text
+                    if selected_model:
+                        piper_input, preparation_error = prepare_piper_text(text, selected_model)
+                        if preparation_error:
+                            err_text = preparation_error
+                            selected_model = ""
                     if not selected_model:
-                        err_text = "No Piper model found. Add a .onnx voice model."
+                        if not err_text:
+                            err_text = "No Piper model found. Add a .onnx voice model."
                     else:
                         # lower length_scale => faster; keep range conservative for intelligibility
                         length_scale = max(0.60, min(1.60, 1.00 - (rate / 220.0)))
@@ -1300,7 +1772,7 @@ class ReaderController:
                         with self._lock:
                             if run_id == self._run_id:
                                 self._proc = proc
-                        proc_input = text
+                        proc_input = piper_input
                         _, stderr_text = proc.communicate(input=proc_input, timeout=None)
                         proc_input = None
                         rc = proc.returncode
@@ -1467,7 +1939,7 @@ class IpcServer(threading.Thread):
                     break
                 with conn:
                     try:
-                        req_raw = conn.recv(4096)
+                        req_raw = conn.recv(1024 * 1024)
                         req = json.loads(req_raw.decode("utf-8")) if req_raw else {}
                         resp = self._handle(req)
                     except Exception as exc:
@@ -1508,6 +1980,25 @@ class IpcServer(threading.Thread):
                 self.on_show(False)
             return {"ok": ok, "message": message, "speaking": self.controller.is_speaking()}
 
+        if cmd == "translate":
+            target = str(self.config.get("translation_target_language", "English")).strip() or "English"
+            ok, message = self.controller.translate_selection_async(target, speak_aloud=False)
+            if ok and self.on_show is not None:
+                self.on_show(False)
+            return {"ok": ok, "message": message, "speaking": self.controller.is_speaking()}
+
+        if cmd == "speak_text":
+            text = str(req.get("text", "")).strip()
+            language = str(req.get("language", "")).strip() or None
+            ok, message = self.controller.speak_text_async(text, language=language)
+            if ok and self.on_show is not None and bool(self.config.get("show_panel_on_hotkey", True)):
+                self.on_show(False)
+            return {"ok": ok, "message": message, "speaking": self.controller.is_speaking()}
+
+        if cmd == "cancel_translation":
+            ok, message = self.controller.cancel_translation()
+            return {"ok": ok, "message": message, "speaking": self.controller.is_speaking()}
+
         if cmd == "stop":
             ok, message = self.controller.stop()
             return {"ok": ok, "message": message, "speaking": self.controller.is_speaking()}
@@ -1530,7 +2021,7 @@ class IpcServer(threading.Thread):
 
 
 class VoiceReadingGui:
-    def __init__(self, read_on_launch: bool) -> None:
+    def __init__(self, read_on_launch: bool, translate_on_launch: bool = False) -> None:
         self.config = ConfigManager(CONFIG_PATH)
         self.events: "queue.Queue[tuple[str, Any, Any]]" = queue.Queue()
 
@@ -1549,10 +2040,26 @@ class VoiceReadingGui:
 
         self.status_var = tk.StringVar(value="Idle")
         self.source_var = tk.StringVar(value="Source: none")
+        self.translation_status_var = tk.StringVar(value="Translation is text-only and uses local Gemma/Ollama")
+        self.translation_target_var = tk.StringVar(
+            value=str(self.config.get("translation_target_language", "English"))
+        )
+        self.translation_speak_var = tk.BooleanVar(
+            value=bool(self.config.get("translation_speak_aloud", False))
+        )
+        self.ollama_model_var = tk.StringVar(
+            value=str(self.config.get("ollama_model", "gemma4:latest"))
+        )
+        configured_context = str(self.config.get("ollama_context_tokens", 2048)).strip()
+        self.ollama_context_var = tk.StringVar(
+            value=configured_context if configured_context in {"1024", "2048", "4096", "8192", "16384"} else "2048"
+        )
+        self._ollama_models: list[str] = []
         self.pause_btn_var = tk.StringVar(value="Pause")
         self.rate_var = tk.IntVar(value=int(self.config.get("rate", 0)))
         self.pitch_var = tk.IntVar(value=int(self.config.get("pitch", 0)))
-        self.lang_var = tk.StringVar(value=str(self.config.get("language", "en")))
+        configured_language = str(self.config.get("language", "en")).strip().lower()
+        self.lang_var = tk.StringVar(value=configured_language if configured_language in {"en", "fr", "it", "he"} else "en")
         self.voice_var = tk.StringVar(value=str(self.config.get("voice", "")))
         self.voice_type_var = tk.StringVar(value=str(self.config.get("voice_type", "male1")))
         self.output_module_var = tk.StringVar(value=str(self.config.get("output_module", "")))
@@ -1566,7 +2073,7 @@ class VoiceReadingGui:
         self.prefer_primary_var = tk.BooleanVar(value=bool(self.config.get("prefer_primary_selection", True)))
         self.copy_fallback_var = tk.BooleanVar(value=bool(self.config.get("capture_selected_text_via_copy", True)))
         self.show_hotkey_var = tk.BooleanVar(value=bool(self.config.get("show_panel_on_hotkey", True)))
-        self.always_on_top_var = tk.BooleanVar(value=bool(self.config.get("window_always_on_top", True)))
+        self.always_on_top_var = tk.BooleanVar(value=bool(self.config.get("window_always_on_top", False)))
         self.ultra_precise_sync_var = tk.BooleanVar(value=bool(self.config.get("ultra_precise_highlight_sync", False)))
         selected_mode = resolve_preprocess_mode(self.config)
         self.preprocess_mode_var = tk.StringVar(value=PREPROCESS_MODE_LABELS.get(selected_mode, PREPROCESS_MODE_LABELS[PREPROCESS_MODE_OFF]))
@@ -1589,6 +2096,7 @@ class VoiceReadingGui:
             on_state_change=lambda speaking, reason: self.events.put(("state", speaking, reason)),
             on_text=lambda text, source: self.events.put(("text", text, source)),
             on_progress=lambda idx, total: self.events.put(("progress", idx, total)),
+            on_translation=lambda text, target, meta: self.events.put(("translation", text, (target, meta))),
         )
         self.ipc = IpcServer(
             controller=self.controller,
@@ -1607,6 +2115,11 @@ class VoiceReadingGui:
             self.controller.read_selection_async()
             if bool(self.config.get("show_panel_on_hotkey", True)):
                 self._show_window(active=False)
+        elif translate_on_launch:
+            target = str(self.config.get("translation_target_language", "English")).strip() or "English"
+            self.controller.translate_selection_async(target, speak_aloud=False)
+            self.translation_frame.pack(fill="both", expand=True, pady=(0, 6))
+            self._show_window(active=False)
         else:
             self._show_window(active=True)
 
@@ -1627,7 +2140,7 @@ class VoiceReadingGui:
 
     def _apply_window_presentation(self) -> None:
         try:
-            keep_on_top = bool(self.always_on_top_var.get()) or self.controller.is_speaking()
+            keep_on_top = bool(self.always_on_top_var.get())
             self.root.attributes("-topmost", keep_on_top)
         except Exception:
             pass
@@ -1657,6 +2170,9 @@ class VoiceReadingGui:
         )
         self.status_label.pack(side="left")
         ttk.Button(self.status_bar, text="Read Selection", style="VR.TButton", command=self._read_from_gui).pack(side="right")
+        ttk.Button(self.status_bar, text="Translate", style="VR.TButton", command=self._translate_from_gui).pack(
+            side="right", padx=(0, 6)
+        )
         ttk.Button(self.status_bar, text="Settings", style="VR.TButton", command=self._toggle_settings).pack(
             side="right", padx=(0, 6)
         )
@@ -1691,6 +2207,64 @@ class VoiceReadingGui:
         self.reading_box.tag_configure("current_word", background="#14532d", foreground="#ecfdf5", font=("DejaVu Sans Mono", 10, "bold"))
         self.reading_box.tag_configure("current_sentence", background="#123524", foreground="#ecfdf5")
 
+        self.translation_frame = ttk.Frame(root, style="VR.Card.TFrame", padding=(8, 8))
+        translation_header = ttk.Frame(self.translation_frame, style="VR.Card.TFrame")
+        translation_header.pack(fill="x")
+        ttk.Label(translation_header, text="Translation", style="VR.Meta.TLabel").pack(side="left")
+        ttk.Label(translation_header, text="Translate to:", style="VR.Meta.TLabel").pack(side="left", padx=(14, 4))
+        self.translation_target_combo = ttk.Combobox(
+            translation_header,
+            textvariable=self.translation_target_var,
+            values=["English", "Hebrew", "French", "Italian"],
+            state="readonly",
+            width=10,
+        )
+        self.translation_target_combo.pack(side="left")
+        ttk.Button(
+            translation_header,
+            text="Translate Text",
+            style="VR.TButton",
+            command=self._translate_from_gui,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            translation_header,
+            text="Cancel",
+            style="VR.TButton",
+            command=self._cancel_translation_from_gui,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            translation_header,
+            text="Copy Translation",
+            style="VR.TButton",
+            command=self._copy_translation,
+        ).pack(side="right")
+        ttk.Checkbutton(
+            translation_header,
+            text="Speak",
+            variable=self.translation_speak_var,
+            command=self._save_options,
+            style="VR.TCheckbutton",
+        ).pack(side="right", padx=(0, 8))
+        self.translation_box = tk.Text(
+            self.translation_frame,
+            wrap="word",
+            height=5,
+            bg="#0b1410",
+            fg="#ecfdf5",
+            insertbackground="#ecfdf5",
+            highlightthickness=0,
+            relief="solid",
+            bd=1,
+        )
+        self.translation_box.pack(fill="both", expand=True, pady=(4, 0))
+        self.translation_box.configure(state="disabled")
+        ttk.Label(
+            self.translation_frame,
+            textvariable=self.translation_status_var,
+            style="VR.Meta.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+        self.translation_frame.pack_forget()
+
         self.settings_visible = False
         self.controls = ttk.Frame(root, style="VR.Card.TFrame", padding=(8, 8))
         self.controls.pack(fill="x", expand=False)
@@ -1715,7 +2289,15 @@ class VoiceReadingGui:
         row2 = ttk.Frame(self.controls, style="VR.Card.TFrame")
         row2.pack(fill="x", pady=(2, 2))
         ttk.Label(row2, text="Language:", style="VR.Meta.TLabel").pack(side="left")
-        ttk.Entry(row2, textvariable=self.lang_var, width=8).pack(side="left", padx=(6, 12))
+        self.language_combo = ttk.Combobox(
+            row2,
+            textvariable=self.lang_var,
+            values=["en", "fr", "it", "he"],
+            state="readonly",
+            width=6,
+        )
+        self.language_combo.pack(side="left", padx=(6, 12))
+        self.language_combo.bind("<<ComboboxSelected>>", self._on_language_changed)
         ttk.Label(row2, text="Voice:", style="VR.Meta.TLabel").pack(side="left")
         self.voice_combo = ttk.Combobox(row2, textvariable=self.voice_var, width=20)
         self.voice_combo.pack(side="left", padx=(6, 0), fill="x", expand=True)
@@ -1728,6 +2310,16 @@ class VoiceReadingGui:
         preprocess_combo["values"] = [PREPROCESS_MODE_LABELS[key] for key in PREPROCESS_MODE_LABELS]
         preprocess_combo.pack(side="left", padx=(6, 12))
         preprocess_combo.bind("<<ComboboxSelected>>", self._save_options)
+        ttk.Label(row2b, text="Translation Model:", style="VR.Meta.TLabel").pack(side="left", padx=(6, 4))
+        self.ollama_model_combo = ttk.Combobox(
+            row2b,
+            textvariable=self.ollama_model_var,
+            values=["gemma4:latest", "gemma4:12b-it-qat"],
+            state="readonly",
+            width=20,
+        )
+        self.ollama_model_combo.pack(side="left")
+        self.ollama_model_combo.bind("<<ComboboxSelected>>", self._on_ollama_model_changed)
 
         row2c = ttk.Frame(self.controls, style="VR.Card.TFrame")
         row2c.pack(fill="x", pady=(2, 2))
@@ -1739,6 +2331,24 @@ class VoiceReadingGui:
             style="VR.TCheckbutton",
         ).pack(side="left")
         ttk.Entry(row2c, textvariable=self.piper_gpu_path_var).pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        row2d = ttk.Frame(self.controls, style="VR.Card.TFrame")
+        row2d.pack(fill="x", pady=(2, 2))
+        ttk.Label(row2d, text="Context tokens:", style="VR.Meta.TLabel").pack(side="left")
+        context_combo = ttk.Combobox(
+            row2d,
+            textvariable=self.ollama_context_var,
+            values=["1024", "2048", "4096", "8192", "16384"],
+            state="readonly",
+            width=8,
+        )
+        context_combo.pack(side="left", padx=(6, 8))
+        context_combo.bind("<<ComboboxSelected>>", self._save_options)
+        ttk.Label(
+            row2d,
+            text="lower values use less VRAM; 2048 is a good RTX 8 GB starting point",
+            style="VR.Meta.TLabel",
+        ).pack(side="left")
 
         row3 = ttk.Frame(self.controls, style="VR.Card.TFrame")
         row3.pack(fill="x", pady=(2, 2))
@@ -1827,10 +2437,10 @@ class VoiceReadingGui:
         self.footer = ttk.Frame(root, style="VR.Root.TFrame")
         self.footer.pack(fill="x", pady=(6, 0))
         ttk.Button(self.footer, text="Apply", style="VR.TButton", command=self._save_options).pack(side="right")
-        ttk.Button(self.footer, text="Refresh Models", style="VR.TButton", command=self._refresh_model_lists).pack(
+        ttk.Button(self.footer, text="Refresh Models", style="VR.TButton", command=self._refresh_all_model_lists).pack(
             side="right", padx=(0, 6)
         )
-        ttk.Button(self.footer, text="Get GB Voices", style="VR.TButton", command=self._open_voice_downloader).pack(
+        ttk.Button(self.footer, text="Get Voices", style="VR.TButton", command=self._open_voice_downloader).pack(
             side="right", padx=(0, 6)
         )
         ttk.Button(self.footer, text="Help", style="VR.TButton", command=self._show_help).pack(side="right", padx=(0, 6))
@@ -1838,6 +2448,8 @@ class VoiceReadingGui:
         self.footer.pack_forget()
 
         self._refresh_model_lists()
+        self._refresh_ollama_models()
+        self._apply_language_default_voice()
 
     def _toggle_settings(self) -> None:
         self.settings_visible = not self.settings_visible
@@ -1848,6 +2460,10 @@ class VoiceReadingGui:
             self.controls.pack_forget()
             self.footer.pack_forget()
 
+    def _refresh_all_model_lists(self) -> None:
+        self._refresh_model_lists()
+        self._refresh_ollama_models()
+
     def _show_help(self) -> None:
         msg = (
             "Read Aloud Hotkey Flow:\n"
@@ -1856,6 +2472,10 @@ class VoiceReadingGui:
             "- Press Super+R again to stop.\n\n"
             "Pause/Resume is available from GUI and resumes from the current place.\n"
             "Use Engine + Model + Voice for quality tuning.\n"
+            "Translate sends the selected text to local Ollama/Gemma and returns text only.\n"
+            "Use Cancel to stop a running translation; starting another translation cancels the previous one.\n"
+            "Supported targets: English, Hebrew, French, Italian.\n"
+            "Piper voice defaults follow the selected language; Hebrew uses the Phonikud voice when installed, with speech-dispatcher/espeak as fallback.\n"
             "Math reading quality depends on selected engine/voice.\n"
             "Reading mode options: Off, Code/Math, Codex output, Markdown raw.\n"
             "Highlight words/sentences can be toggled independently."
@@ -1938,9 +2558,54 @@ class VoiceReadingGui:
             self.voice_combo["values"] = []
             self.voice_combo.configure(state="normal")
 
+        if self.engine_var.get().strip() == "piper":
+            self._apply_language_default_voice()
+
+    def _refresh_ollama_models(self) -> None:
+        configured = str(self.config.get("ollama_model", "gemma4:latest")).strip()
+        models = list_ollama_models(str(self.config.get("ollama_url", "http://127.0.0.1:11434")))
+        if configured and configured not in models:
+            models.insert(0, configured)
+        if not models:
+            models = [configured or "gemma4:latest", "gemma4:12b-it-qat"]
+        self._ollama_models = list(dict.fromkeys(models))
+        self.ollama_model_combo["values"] = self._ollama_models
+        if configured in self._ollama_models:
+            self.ollama_model_var.set(configured)
+        elif self._ollama_models:
+            self.ollama_model_var.set(self._ollama_models[0])
+        self._save_options()
+
+    def _on_ollama_model_changed(self, _event: Any = None) -> None:
+        self.config.set("ollama_model", self.ollama_model_var.get().strip() or "gemma4:latest")
+        try:
+            context_tokens = max(512, min(262144, int(self.ollama_context_var.get().strip())))
+        except (TypeError, ValueError):
+            context_tokens = 2048
+        self.config.set("ollama_context_tokens", context_tokens)
+        self.translation_status_var.set(f"Translation model: {self.ollama_model_var.get().strip()}")
+
     def _on_engine_changed(self, _event: Any = None) -> None:
         self._refresh_model_lists()
         self._save_options()
+
+    def _on_language_changed(self, _event: Any = None) -> None:
+        self._apply_language_default_voice()
+        self._save_options()
+
+    def _apply_language_default_voice(self) -> None:
+        if self.engine_var.get().strip() != "piper":
+            return
+        selected_path = choose_piper_model_for_language(
+            list_piper_model_paths(), self.lang_var.get().strip()
+        )
+        if not selected_path:
+            return
+        for label, path in self._piper_model_map.items():
+            if path == selected_path:
+                self.output_module_var.set(label)
+                self.config.set("piper_model", selected_path)
+                return
 
     def _on_module_changed(self, _event: Any = None) -> None:
         engine = self.engine_var.get().strip()
@@ -1983,6 +2648,14 @@ class VoiceReadingGui:
         self.config.set("capture_selected_text_via_copy", bool(self.copy_fallback_var.get()))
         self.config.set("show_panel_on_hotkey", bool(self.show_hotkey_var.get()))
         self.config.set("window_always_on_top", bool(self.always_on_top_var.get()))
+        self.config.set("translation_target_language", self.translation_target_var.get().strip() or "English")
+        self.config.set("translation_speak_aloud", bool(self.translation_speak_var.get()))
+        self.config.set("ollama_model", self.ollama_model_var.get().strip() or "gemma4:latest")
+        try:
+            context_tokens = max(512, min(262144, int(self.ollama_context_var.get().strip())))
+        except (TypeError, ValueError):
+            context_tokens = 2048
+        self.config.set("ollama_context_tokens", context_tokens)
         self.config.set("ultra_precise_highlight_sync", bool(self.ultra_precise_sync_var.get()))
         mode_label = self.preprocess_mode_var.get().strip()
         mode_key = PREPROCESS_MODE_LABEL_TO_KEY.get(mode_label, PREPROCESS_MODE_OFF)
@@ -2004,6 +2677,38 @@ class VoiceReadingGui:
         if not ok:
             self.status_var.set(message)
             notify("Voice Reading", message, urgency="critical")
+
+    def _translate_from_gui(self) -> None:
+        target = self.translation_target_var.get().strip()
+        self.config.set("translation_target_language", target)
+        self.config.set("translation_speak_aloud", bool(self.translation_speak_var.get()))
+        self.config.set("ollama_model", self.ollama_model_var.get().strip() or "gemma4:latest")
+        ok, message = self.controller.translate_selection_async(
+            target,
+            speak_aloud=bool(self.translation_speak_var.get()),
+        )
+        self.translation_status_var.set(message)
+        if ok:
+            self.translation_frame.pack(fill="both", expand=True, pady=(0, 6))
+            self.status_var.set("Translating…")
+        else:
+            notify("Voice Reading", message, urgency="critical")
+
+    def _copy_translation(self) -> None:
+        self.translation_box.configure(state="normal")
+        text = self.translation_box.get("1.0", "end").strip()
+        self.translation_box.configure(state="disabled")
+        if text and write_clipboard(text):
+            self.translation_status_var.set("Translation copied to clipboard")
+            notify("Voice Reading", "Translation copied to clipboard")
+        elif not text:
+            self.translation_status_var.set("No translation available")
+
+    def _cancel_translation_from_gui(self) -> None:
+        ok, message = self.controller.cancel_translation()
+        self.translation_status_var.set(message)
+        if ok:
+            self.status_var.set("Translation cancelled")
 
     def _pause_resume_from_gui(self) -> None:
         ok, message = self.controller.pause_or_resume()
@@ -2033,19 +2738,23 @@ class VoiceReadingGui:
             pass
 
     def _open_voice_downloader(self) -> None:
-        catalog = list_gb_voice_catalog()
+        catalog = list_voice_catalog()
         if not catalog:
             messagebox.showerror(APP_NAME, "Bundled voice index not found (piper_voices/index/voices.json).")
             return
 
         dialog = tk.Toplevel(self.root)
-        dialog.title("Download British Voices")
+        dialog.title("Download Piper Voices")
         dialog.configure(bg="#0f1115", padx=12, pady=12)
         dialog.transient(self.root)
 
         tk.Label(
             dialog,
-            text="British (en_GB) Piper voices — downloaded from Hugging Face into piper_voices/",
+            text=(
+                "Piper voices — downloaded from Hugging Face into piper_voices/. "
+                "Rows show speaker, language/locale, quality, and size. "
+                "The Hebrew Phonikud row also downloads its phonemizer model."
+            ),
             font=("DejaVu Sans Mono", 9),
             fg="#94a3b8",
             bg="#0f1115",
@@ -2054,8 +2763,8 @@ class VoiceReadingGui:
 
         listbox = tk.Listbox(
             dialog,
-            height=min(12, len(catalog)),
-            width=64,
+            height=min(18, len(catalog)),
+            width=112,
             bg="#0b1410",
             fg="#ecfdf5",
             selectbackground="#14532d",
@@ -2064,7 +2773,18 @@ class VoiceReadingGui:
         )
         for item in catalog:
             mark = "  [installed]" if item["installed"] else ""
-            listbox.insert("end", f"{item['key']}  ({item['quality']}, {item['size_mb']} MB){mark}")
+            if item["is_default"]:
+                mark += "  [recommended default]"
+            language_label = f"{item['language_name']} [{item['language']}]"
+            native = f" / {item['language_native']}" if item["language_native"] else ""
+            speakers = f"speaker={item['speaker']}"
+            if item["num_speakers"] != 1:
+                speakers += f" ({item['num_speakers']} speakers)"
+            listbox.insert(
+                "end",
+                f"{item['key']:<34} {language_label}{native:<26} {speakers:<24} "
+                f"quality={item['quality']:<6} size={item['size_mb']} MB{mark}",
+            )
         listbox.pack(fill="both", expand=True)
 
         progress_var = tk.StringVar(value="")
@@ -2180,6 +2900,22 @@ class VoiceReadingGui:
                 self._set_reading_text(text)
                 self._highlight_progress(0)
 
+            if event == "translation":
+                text = str(data).strip()
+                target, meta = meta if isinstance(meta, tuple) else ("", "")
+                if text:
+                    self.translation_box.configure(state="normal")
+                    self.translation_box.delete("1.0", "end")
+                    self.translation_box.insert("1.0", text)
+                    self.translation_box.configure(state="disabled")
+                    self.translation_frame.pack(fill="both", expand=True, pady=(0, 6))
+                    self.translation_status_var.set(f"Translated to {target} ({meta})")
+                    self.status_var.set("Translation ready")
+                else:
+                    message = str(meta)
+                    self.translation_status_var.set(message)
+                    self.status_var.set("Translation cancelled" if "cancel" in message.lower() else "Translation failed")
+
             if event == "progress":
                 try:
                     idx = int(data)
@@ -2283,6 +3019,7 @@ class VoiceReadingGui:
                 pass
 
     def _on_close(self) -> None:
+        self.controller.cancel_translation()
         if self.controller.is_speaking():
             self.controller.stop()
         self.ipc.stop()
@@ -2321,10 +3058,12 @@ def send_ipc_with_retries(request: dict[str, Any], attempts: int = 2, timeout: f
     return None
 
 
-def spawn_gui(read_on_launch: bool) -> None:
+def spawn_gui(read_on_launch: bool, translate_on_launch: bool = False) -> None:
     cmd = [sys.executable, str(Path(__file__).resolve()), "gui"]
     if read_on_launch:
         cmd.append("--read-on-launch")
+    if translate_on_launch:
+        cmd.append("--translate-on-launch")
     subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -2333,12 +3072,14 @@ def spawn_gui(read_on_launch: bool) -> None:
     )
 
 
-def reuse_existing_gui(read_on_launch: bool) -> bool:
+def reuse_existing_gui(read_on_launch: bool, translate_on_launch: bool = False) -> bool:
     status = send_ipc_with_retries({"cmd": "status"}, attempts=2, timeout=0.6)
     if status is None:
         return False
     if read_on_launch:
         send_ipc_with_retries({"cmd": "toggle"}, attempts=2, timeout=0.8)
+    elif translate_on_launch:
+        send_ipc_with_retries({"cmd": "translate"}, attempts=2, timeout=1.0)
     else:
         send_ipc_with_retries({"cmd": "show"}, attempts=1, timeout=0.6)
     return True
@@ -2373,6 +3114,16 @@ def cmd_stop() -> int:
     return 0 if resp.get("ok", False) else 1
 
 
+def cmd_translate() -> int:
+    resp = send_ipc_with_retries({"cmd": "translate"}, attempts=2, timeout=1.0)
+    if resp is not None:
+        print(resp.get("message", "ok"))
+        return 0 if resp.get("ok", False) else 1
+    spawn_gui(read_on_launch=False, translate_on_launch=True)
+    print("Started Voice Reading and began translation")
+    return 0
+
+
 def cmd_status() -> int:
     resp = send_ipc_with_retries({"cmd": "status"}, attempts=2, timeout=0.6)
     if resp is None:
@@ -2388,9 +3139,11 @@ def main() -> int:
 
     gui_parser = sub.add_parser("gui", help="Run Voice Reading GUI")
     gui_parser.add_argument("--read-on-launch", action="store_true")
+    gui_parser.add_argument("--translate-on-launch", action="store_true")
 
     sub.add_parser("toggle", help="Toggle read/stop via IPC (for hotkey)")
     sub.add_parser("read", help="Read selected text")
+    sub.add_parser("translate", help="Translate selected text in the Reader GUI")
     sub.add_parser("stop", help="Stop reading")
     sub.add_parser("status", help="Show server status")
     sub.add_parser("list-gb-voices", help="List downloadable British piper voices")
@@ -2401,15 +3154,23 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "gui":
-        if reuse_existing_gui(read_on_launch=bool(args.read_on_launch)):
+        if reuse_existing_gui(
+            read_on_launch=bool(args.read_on_launch),
+            translate_on_launch=bool(args.translate_on_launch),
+        ):
             return 0
-        app = VoiceReadingGui(read_on_launch=bool(args.read_on_launch))
+        app = VoiceReadingGui(
+            read_on_launch=bool(args.read_on_launch),
+            translate_on_launch=bool(args.translate_on_launch),
+        )
         app.run()
         return 0
     if args.command == "toggle":
         return cmd_toggle()
     if args.command == "read":
         return cmd_read()
+    if args.command == "translate":
+        return cmd_translate()
     if args.command == "stop":
         return cmd_stop()
     if args.command == "status":

@@ -69,6 +69,7 @@ CONFIG_DIR = resolve_config_dir()
 CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_DIR = Path("/tmp/voice_typing")
 SOCKET_PATH = "/tmp/voice_typing.sock"
+VOICE_READING_SOCKET_PATH = "/tmp/voice_reading.sock"
 AUDIO_PATH = STATE_DIR / "recording.wav"
 CHUNK_DIR = STATE_DIR / "chunks"
 TRANSCRIPT_PREFIX = STATE_DIR / "transcript"
@@ -86,6 +87,43 @@ ENGINE_ALIASES = {
 }
 LEGACY_WHISPER_CLI_PATH = "~/whisper.cpp/build/bin/whisper-cli"
 CUDA_WHISPER_CLI_PATH = "~/whisper.cpp/build-cuda/bin/whisper-cli"
+
+
+def language_family(language: str) -> str:
+    value = str(language).strip().lower().replace("-", "_")
+    aliases = {"english": "en", "french": "fr", "italian": "it", "hebrew": "he"}
+    return aliases.get(value, value.split("_", 1)[0])
+
+
+def speak_with_voice_reader(text: str, language: str) -> bool:
+    """Use the Reader's language-aware TTS process when it is running."""
+    text = text.strip()
+    if not text:
+        return False
+    request = json.dumps(
+        {"cmd": "speak_text", "text": text, "language": language},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(1.2)
+    try:
+        client.connect(VOICE_READING_SOCKET_PATH)
+        client.sendall(request)
+        raw = client.recv(65536)
+        response = json.loads(raw.decode("utf-8")) if raw else {}
+        ok = bool(response.get("ok", False))
+        log_routing(
+            f"translation: reader TTS {'accepted' if ok else 'rejected'} language={language!r}"
+        )
+        return ok
+    except Exception as exc:
+        log_routing(f"translation: reader TTS unavailable language={language!r}: {exc}")
+        return False
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def prefer_cuda_whisper_cli(data: dict[str, Any]) -> None:
@@ -108,31 +146,37 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "gemma_dtype": "auto",
     "gemma_max_new_tokens": 192,
     "gemma_transcribe_prompt": (
-        "Transcribe the following speech segment in its original language. "
-        "Follow these specific instructions for formatting the answer:\n"
-        "* Only output the transcription, with no newlines.\n"
-        "* When transcribing numbers, write the digits, i.e. write 1.7 and not one point seven, "
-        "and write 3 instead of three."
+        "Transcribe the following speech segment exactly in the language that was spoken. "
+        "Automatically detect the language. Preserve the original Unicode writing system, "
+        "including Hebrew, Arabic, Cyrillic, Greek, accented Latin letters, and punctuation. "
+        "Do not translate, transliterate, or answer the speaker. Output only the transcription "
+        "as plain text on one line. When transcribing numbers, use digits."
     ),
     "ollama_url": "http://127.0.0.1:11434",
     "ollama_model": "gemma4:latest",
+    "ollama_context_tokens": 2048,
     "ollama_timeout_seconds": 300,
     "ollama_keep_alive": "30m",
     "ollama_max_tokens": 512,
     "ollama_disable_thinking": True,
     "ollama_normalize_audio": True,
     "assistant_answer_mode": False,
+    "dictation_translation_enabled": False,
+    "dictation_translation_target_language": "English",
+    "dictation_translation_speak_aloud": False,
     "answer_speak_aloud": True,
     "answer_voice_model": "",
     "ollama_ask_system_prompt": (
         "You are a helpful local assistant. Answer briefly in plain text only - "
-        "no markdown, no headers, no bullet symbols. Your answer is typed "
-        "directly into the user's focused text field."
+        "no markdown, no headers, no bullet symbols. Reply in the user's language "
+        "unless the user explicitly requests another language. Preserve Unicode scripts "
+        "such as Hebrew exactly. Your answer is typed directly into the user's focused text field."
     ),
     "ollama_answer_max_tokens": 600,
     "ollama_transcribe_prompt": (
-        "Transcribe this audio segment. Only output the spoken words. "
-        "If there is no speech, output nothing."
+        "Transcribe this audio segment in the original spoken language. Automatically detect "
+        "the language and preserve its original Unicode script. Do not translate or transliterate. "
+        "Only output the spoken words. If there is no speech, output nothing."
     ),
     "recording_max_seconds": 1800,
     "recording_warn_before_seconds": 30,
@@ -145,7 +189,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "streaming_chunk_seconds": 28,
     "streaming_route_partials": True,
     "no_gpu": False,
-    "language": "en",
+    "language": "auto",
     "voice_commands_enabled": True,
     "voice_command_prefixes": ["voice typing", "computer", "hey antonio", "good morning antonio"],
     "assistant_wake_mode": False,
@@ -156,10 +200,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ask_when_focus_uncertain": False,
     "auto_paste_current_focus": False,
     "copy_to_clipboard_when_started_from_gui": False,
+    "always_copy_hotkey_to_clipboard": True,
     "direct_type_fallback_for_hotkey": True,
+    "direct_type_max_chars_for_hotkey": 0,
     "paste_fallback_for_hotkey": True,
     "restore_clipboard_after_paste": False,
-    "window_always_on_top": True,
+    "window_always_on_top": False,
     "show_panel_on_hotkey_start": True,
     "window_opacity": 0.95,
 }
@@ -254,6 +300,28 @@ class ConfigManager:
 
         data = dict(DEFAULT_CONFIG)
         data.update(loaded)
+        # Older builds defaulted to always-on-top, which could steal the
+        # compositor's effective focus during a hotkey recording. Migrate
+        # that legacy default once; the Settings checkbox can re-enable it.
+        if isinstance(loaded, dict) and "window_always_on_top" in loaded and not loaded.get(
+            "focus_safe_migration_v1", False
+        ):
+            data["window_always_on_top"] = False
+            data["focus_safe_migration_v1"] = True
+        # The multilingual Whisper model uses automatic language detection.
+        # Migrate the old English-forced default only when the selected model
+        # is not an English-only .en model; users can still choose English in
+        # the GUI afterward.
+        selected_model = str(data.get("model", "")).strip().lower()
+        if (
+            isinstance(loaded, dict)
+            and str(loaded.get("language", "")).strip().lower() == "en"
+            and selected_model
+            and not selected_model.endswith(".en.bin")
+            and not loaded.get("multilingual_language_migration_v1", False)
+        ):
+            data["language"] = "auto"
+            data["multilingual_language_migration_v1"] = True
         prefer_cuda_whisper_cli(data)
         self._select_default_model(data)
         self._save_best_effort(data)
@@ -340,10 +408,10 @@ class ConfigManager:
             return
 
         preferred = [
-            "ggml-small.en.bin",
-            "ggml-base.en.bin",
             "ggml-small.bin",
             "ggml-base.bin",
+            "ggml-small.en.bin",
+            "ggml-base.en.bin",
         ]
         for candidate in preferred:
             if candidate in models:
@@ -506,6 +574,19 @@ def list_ollama_models(base_url: str, timeout: float = 3.0) -> list[str]:
     models = payload.get("models", []) if isinstance(payload, dict) else []
     names = [str(item.get("name", "")) for item in models if isinstance(item, dict)]
     return sorted(name for name in names if name)
+
+
+def ollama_generation_options(config: "ConfigManager", output_tokens: int | None = None) -> dict[str, Any]:
+    """Build native Ollama options, including the VRAM-sensitive context size."""
+    try:
+        context_tokens = int(config.get("ollama_context_tokens", 2048))
+    except (TypeError, ValueError):
+        context_tokens = 2048
+    context_tokens = max(512, min(262144, context_tokens))
+    options: dict[str, Any] = {"num_ctx": context_tokens}
+    if output_tokens is not None:
+        options["num_predict"] = max(1, int(output_tokens))
+    return options
 
 
 def _normalize_command_text(text: str) -> str:
@@ -1415,7 +1496,7 @@ class SentenceSpeaker:
 
     def __init__(self, config: ConfigManager) -> None:
         self.config = config
-        self._queue: "queue.Queue[str | None]" = queue.Queue()
+        self._queue: "queue.Queue[tuple[str, str | None] | None]" = queue.Queue()
         self._player: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
         self._generation = 0
@@ -1436,21 +1517,47 @@ class SentenceSpeaker:
         found = shutil.which("piper")
         return Path(found) if found else None
 
-    def _voice_model(self) -> Path | None:
+    def _model_language_family(self, path: Path) -> str:
+        for part in reversed(path.parts):
+            match = re.match(r"([a-z]{2})(?:[_-]|$)", part.lower())
+            if match:
+                return match.group(1)
+        return ""
+
+    def _voice_model(self, language: str | None = None) -> Path | None:
+        target_family = language_family(language or "") if language else ""
+
+        def matches(path: Path) -> bool:
+            return not target_family or self._model_language_family(path) == target_family
+
         configured = str(self.config.get("answer_voice_model", "")).strip()
         if configured:
             path = Path(os.path.expanduser(configured))
-            if path.exists():
+            if path.exists() and matches(path):
                 return path
         # Reuse the reading app's chosen voice when available.
         try:
             reading_config = json.loads((CONFIG_DIR / "reading_config.json").read_text(encoding="utf-8"))
             path = Path(os.path.expanduser(str(reading_config.get("piper_model", ""))))
-            if path.exists():
+            if path.exists() and matches(path):
                 return path
         except Exception:
             pass
         voices_root = Path(__file__).resolve().parent / "piper_voices"
+        if target_family:
+            preferred = {
+                "en": "en_GB-cori-high",
+                "fr": "fr_FR-upmc-medium",
+                "it": "it_IT-paola-medium",
+                "he": "he_IL-phonikud-medium",
+            }.get(target_family, "")
+            if preferred:
+                for candidate in voices_root.rglob("*.onnx"):
+                    if preferred.lower() in candidate.name.lower() and matches(candidate):
+                        return candidate
+            for candidate in voices_root.rglob("*.onnx"):
+                if matches(candidate):
+                    return candidate
         for preferred in ("jenny_dioco", "cori", "alba"):
             for candidate in voices_root.rglob(f"*{preferred}*.onnx"):
                 return candidate
@@ -1459,10 +1566,10 @@ class SentenceSpeaker:
     def available(self) -> bool:
         return self._piper_binary() is not None and self._voice_model() is not None
 
-    def speak(self, sentence: str) -> None:
+    def speak(self, sentence: str, language: str | None = None) -> None:
         sentence = sentence.strip()
         if sentence:
-            self._queue.put(sentence)
+            self._queue.put((sentence, language))
 
     def stop(self) -> None:
         with self._lock:
@@ -1481,14 +1588,15 @@ class SentenceSpeaker:
 
     def _worker(self) -> None:
         while True:
-            sentence = self._queue.get()
-            if sentence is None:
+            item = self._queue.get()
+            if item is None:
                 continue
+            sentence, language = item
             self._busy = True
             with self._lock:
                 generation = self._generation
             piper = self._piper_binary()
-            model = self._voice_model()
+            model = self._voice_model(language)
             if piper is None or model is None:
                 continue
             wav_path = STATE_DIR / "answer_tts.wav"
@@ -1551,6 +1659,7 @@ class RecorderController:
         self._last_known_focus_at = 0.0
         self._last_transcript: str = ""
         self._recording_mode = "single"
+        self._translate_next_recording = False
         self._stop_recording_event: threading.Event | None = None
         self._chunk_queue: "queue.Queue[tuple[int, Path] | None] | None" = None
         self._transcriber_lock = threading.Lock()
@@ -1628,12 +1737,21 @@ class RecorderController:
         return False
 
     def restore_original_focus_target(self, max_age_seconds: float = 10.0) -> bool:
-        # Prefer the recording start target, then resolved hint, then recent focus cache.
-        candidates: list[FocusTarget | None] = [self._focus_target, self._focus_target_at_start]
-        if self._focus_target is None and self._focus_target_at_start is not None:
-            resolved = resolve_focus_target_from_hint(self._focus_target_at_start)
-            candidates.append(resolved)
-        candidates.append(self._recent_focus_target(max_age_seconds=min(max_age_seconds, 1.0)))
+        # Once a recording has a start identity, never fall back to whatever
+        # happens to be focused at delivery time. That fallback is what made a
+        # later click redirect the result into the wrong field.
+        start_target = self._focus_target_at_start
+        locked_start = has_focus_target_identity(start_target)
+        candidates: list[FocusTarget | None] = []
+        if locked_start:
+            if same_focus_target(self._focus_target, start_target):
+                candidates.append(self._focus_target)
+            candidates.append(start_target)
+            if self._focus_target is None:
+                candidates.append(resolve_focus_target_from_hint(start_target))
+        else:
+            candidates.extend([self._focus_target, start_target])
+            candidates.append(self._recent_focus_target(max_age_seconds=min(max_age_seconds, 1.0)))
 
         for candidate in candidates:
             if candidate is None:
@@ -1695,6 +1813,12 @@ class RecorderController:
     def _should_use_chunked_recording(self) -> bool:
         # Gemma 4 accepts at most 30 seconds of audio per prompt, so it always
         # uses segmented capture. Whisper can opt in for live partial routing.
+        # A one-shot translation must wait for the complete Whisper transcript
+        # before sending it to Gemma, so it never routes untranslated partials.
+        if self._translate_next_recording or bool(
+            self.config.get("dictation_translation_enabled", False)
+        ):
+            return False
         return self._engine() in {"gemma4-transformers", "ollama"} or bool(
             self.config.get("streaming_transcription", False)
         )
@@ -1716,7 +1840,8 @@ class RecorderController:
         return seconds
 
     def _transcriber_preflight_error(self) -> str | None:
-        engine = self._engine()
+        translation_enabled = bool(self.config.get("dictation_translation_enabled", False))
+        engine = "whisper" if self._translate_next_recording or translation_enabled else self._engine()
         if engine == "ollama":
             model_name = self.config.ollama_model()
             if not model_name:
@@ -1749,6 +1874,12 @@ class RecorderController:
         model_path = self.config.model_path()
         if not model_path.exists():
             return f"Model not found: {model_path}"
+        language = str(self.config.get("language", "auto")).strip().lower()
+        if language not in {"", "auto", "en", "english"} and model_path.name.lower().endswith(".en.bin"):
+            return (
+                f"The selected Whisper model is English-only ({model_path.name}). "
+                "Download/select a multilingual model such as ggml-small.bin for Hebrew, French, or Italian."
+            )
         return None
 
     def _report_audio_quality(self, audio_path: Path) -> str:
@@ -1881,20 +2012,25 @@ class RecorderController:
                     "role": "system",
                     "content": str(
                         self.config.get("ollama_ask_system_prompt", DEFAULT_CONFIG["ollama_ask_system_prompt"])
-                    ),
+                    ) + " Reply in the user's spoken language unless another language is requested; preserve Unicode scripts exactly.",
                 },
                 {"role": "user", "content": question},
             ],
             "stream": False,
-            "temperature": 0.3,
-            "max_tokens": int(self.config.get("ollama_answer_max_tokens", 600)),
+            "options": {
+                **ollama_generation_options(
+                    self.config,
+                    int(self.config.get("ollama_answer_max_tokens", 600)),
+                ),
+                "temperature": 0.3,
+            },
         }
         if bool(self.config.get("ollama_disable_thinking", True)):
-            payload["reasoning_effort"] = "none"
+            payload["think"] = False
         timeout_sec = int(self.config.get("ollama_timeout_seconds", 120))
         try:
             req = urllib.request.Request(
-                f"{self.config.ollama_url()}/v1/chat/completions",
+                f"{self.config.ollama_url()}/api/chat",
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
@@ -1909,13 +2045,81 @@ class RecorderController:
         except Exception as exc:
             return "", f"Ollama answer failed: {exc}"
         try:
-            content = data.get("choices", [])[0].get("message", {}).get("content", "")
+            content = data.get("message", {}).get("content", "")
+            if not content:
+                content = data.get("choices", [])[0].get("message", {}).get("content", "")
         except Exception:
             content = ""
         answer = str(content).strip()
         if not answer:
             return "", "Ollama returned an empty answer"
         return answer, None
+
+    def translate_text_ollama(self, text: str, target_language: str) -> tuple[str, str | None]:
+        """Translate plain text through the configured local Ollama model."""
+        text = text.strip()
+        target_language = target_language.strip()
+        if not text:
+            return "", "Empty text to translate"
+        if not target_language:
+            return "", "Translation target language is empty"
+        payload = {
+            "model": self.config.ollama_model(),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise translator. Detect the source language and translate "
+                        f"the text into {target_language}. Output only the translation. Do not "
+                        "explain, summarize, transliterate, add labels, or use markdown. Preserve "
+                        "paragraphs, punctuation, names, numbers, and Unicode scripts."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            "stream": False,
+            "options": {
+                **ollama_generation_options(self.config, max(256, min(2048, len(text) * 3))),
+                "temperature": 0.1,
+            },
+            # Do not let Gemma4 consume the output budget with hidden
+            # reasoning; this endpoint is expected to return the translation.
+            "think": False,
+            "keep_alive": str(self.config.get("ollama_keep_alive", "30m")),
+        }
+        timeout_sec = int(self.config.get("ollama_timeout_seconds", 300))
+        log_routing(
+            f"translation: start model={self.config.ollama_model()!r} target={target_language!r} chars={len(text)}"
+        )
+        try:
+            req = urllib.request.Request(
+                f"{self.config.ollama_url()}/api/chat",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                detail = str(exc)
+            log_routing(f"translation: HTTP failure target={target_language!r} detail={detail[:240]!r}")
+            return "", f"Translation failed: {detail or exc}"
+        except Exception as exc:
+            log_routing(f"translation: request failure target={target_language!r} error={exc!r}")
+            return "", f"Translation failed: {exc}"
+        try:
+            result = str(data.get("message", {}).get("content", "")).strip()
+            if not result:
+                result = str(data["choices"][0]["message"].get("content", "")).strip()
+        except Exception:
+            result = ""
+        if not result:
+            log_routing(f"translation: empty response target={target_language!r}")
+            return "", "Gemma returned an empty translation"
+        log_routing(f"translation: success target={target_language!r} chars={len(result)}")
+        return result, None
 
     def ask_ollama_stream(self, question: str, on_sentence: Callable[[str], None]) -> tuple[str, str | None]:
         """Like ask_ollama, but streams tokens and emits complete sentences
@@ -1931,16 +2135,21 @@ class RecorderController:
                     "role": "system",
                     "content": str(
                         self.config.get("ollama_ask_system_prompt", DEFAULT_CONFIG["ollama_ask_system_prompt"])
-                    ),
+                    ) + " Reply in the user's spoken language unless another language is requested; preserve Unicode scripts exactly.",
                 },
                 {"role": "user", "content": question},
             ],
             "stream": True,
-            "temperature": 0.3,
-            "max_tokens": int(self.config.get("ollama_answer_max_tokens", 600)),
+            "options": {
+                **ollama_generation_options(
+                    self.config,
+                    int(self.config.get("ollama_answer_max_tokens", 600)),
+                ),
+                "temperature": 0.3,
+            },
         }
         if bool(self.config.get("ollama_disable_thinking", True)):
-            payload["reasoning_effort"] = "none"
+            payload["think"] = False
         timeout_sec = int(self.config.get("ollama_timeout_seconds", 120))
 
         sentence_end = re.compile(r"(?<=[.!?:;])\s+")
@@ -1963,22 +2172,22 @@ class RecorderController:
 
         try:
             req = urllib.request.Request(
-                f"{self.config.ollama_url()}/v1/chat/completions",
+                f"{self.config.ollama_url()}/api/chat",
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
             with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
                 for raw_line in resp:
                     line = raw_line.decode("utf-8", errors="ignore").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data_part = line[5:].strip()
+                    data_part = line[5:].strip() if line.startswith("data:") else line
                     if data_part == "[DONE]":
                         break
                     try:
                         chunk = json.loads(data_part)
                         delta = chunk.get("choices", [{}])[0].get("delta", {})
                         token = str(delta.get("content") or "")
+                        if not token:
+                            token = str(chunk.get("message", {}).get("content") or "")
                     except Exception:
                         continue
                     if token:
@@ -2007,6 +2216,7 @@ class RecorderController:
             payload = {
                 "model": model_name,
                 "keep_alive": str(self.config.get("ollama_keep_alive", "30m")),
+                "options": ollama_generation_options(self.config),
             }
             try:
                 req = urllib.request.Request(
@@ -2033,6 +2243,25 @@ class RecorderController:
             focus_target=None,
             focus_target_at_start_hint=focus_target_from_hint(focus_hint),
         )
+
+    def start_translation_recording(
+        self,
+        capture_focus: bool,
+        started_from_gui: bool,
+        focus_hint: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Record one take, then translate the complete Whisper transcript."""
+        with self._lock:
+            self._translate_next_recording = True
+        ok, message = self.start_recording(
+            capture_focus=capture_focus,
+            started_from_gui=started_from_gui,
+            focus_hint=focus_hint,
+        )
+        if not ok:
+            with self._lock:
+                self._translate_next_recording = False
+        return ok, message
 
     def start_recording_with_target(
         self,
@@ -2147,7 +2376,11 @@ class RecorderController:
                 f"sig={self._focus_target.source_signature[:120]!r}"
             )
         elif self._focus_target is None and self._focus_target_at_start is None:
-            log_routing("start_recording: no focus target captured for hotkey flow")
+            # The global shortcut can briefly leave AT-SPI without a focused
+            # node. Give the original field a short chance to reappear before
+            # falling back to clipboard-only delivery.
+            log_routing("start_recording: scheduling short post-hotkey target capture")
+            threading.Thread(target=self._refresh_focus_target_soon, daemon=True).start()
         elif self._focus_target is None and self._focus_target_at_start is not None:
             log_routing(
                 "start_recording: using focus hint "
@@ -2272,17 +2505,35 @@ class RecorderController:
                     return
                 if self._focus_target is not None:
                     return
+                start_target = self._focus_target_at_start
+                started_at = self._started_at
+            # If the hotkey supplied no hint at all, only accept a target in
+            # this short post-hotkey window. After that, a newly clicked field
+            # must never become the destination for the old recording.
+            if not has_focus_target_identity(start_target) and time.time() - started_at > 1.8:
+                log_routing("start_recording: no target captured during post-hotkey window")
+                return
             candidate = capture_focus_target_for_hotkey(retries=4, delay_s=0.03)
             if candidate is None:
                 continue
             if candidate.source_pid == os.getpid():
                 continue
-            self._remember_focus_target(candidate)
+            # A delayed retry may observe a field the user clicked after the
+            # hotkey. Do not let that replace the original recording target.
+            if has_focus_target_identity(start_target) and not same_focus_target(candidate, start_target):
+                log_routing(
+                    "start_recording: rejected delayed target because it differs from start target "
+                    f"candidate={candidate.source_app!r}/{candidate.source_pid} "
+                    f"start={start_target.source_app!r}/{start_target.source_pid}"
+                )
+                continue
             with self._lock:
                 if not self._recording or self._focus_target is not None:
                     return
                 self._focus_target = candidate
-                self._focus_target_at_start = candidate
+                if self._focus_target_at_start is None:
+                    self._focus_target_at_start = candidate
+            self._remember_focus_target(candidate)
             log_routing(
                 "start_recording: delayed capture target "
                 f"app={candidate.source_app!r} pid={candidate.source_pid} sig={candidate.source_signature[:120]!r}"
@@ -2692,6 +2943,9 @@ class RecorderController:
 
     def _finish_transcription(self, reason: str) -> tuple[bool, str]:
         try:
+            with self._lock:
+                translate_this_take = self._translate_next_recording
+                self._last_route_note = ""
             if not AUDIO_PATH.exists() or AUDIO_PATH.stat().st_size == 0:
                 notify("Voice typing", "No audio captured")
                 return False, "No audio captured"
@@ -2708,7 +2962,9 @@ class RecorderController:
                 return False, message
 
             notify("Voice typing", "Transcribing...")
-            text, err = self._transcribe_audio_path(AUDIO_PATH)
+            translation_enabled = bool(self.config.get("dictation_translation_enabled", False))
+            force_whisper = translate_this_take or translation_enabled
+            text, err = self._transcribe_audio_path(AUDIO_PATH, force_whisper=force_whisper)
             if err:
                 notify("Voice typing", err + saved_hint + quality_hint, urgency="critical")
                 return False, err
@@ -2720,7 +2976,32 @@ class RecorderController:
                 return False, "Transcript is empty"
 
             display_text = transcript
-            if bool(self.config.get("assistant_answer_mode", False)):
+            translation_target = str(
+                self.config.get("dictation_translation_target_language", "English")
+            ).strip()
+            if translate_this_take or (
+                bool(self.config.get("dictation_translation_enabled", False))
+                and not bool(self.config.get("assistant_answer_mode", False))
+            ):
+                notify("Voice typing", f"Translating to {translation_target}...")
+                translated, translation_error = self.translate_text_ollama(transcript, translation_target)
+                if translation_error:
+                    # Preserve the original transcript instead of losing it if
+                    # Ollama is unavailable or the model rejects the request.
+                    notify("Voice typing", f"{translation_error}. Original transcript kept.", urgency="critical")
+                    self._last_route_note = f"Translation to {translation_target} failed; original kept."
+                else:
+                    transcript = translated
+                    display_text = translated
+                    self._last_route_note = f"Translated to {translation_target}."
+                    if bool(self.config.get("dictation_translation_speak_aloud", False)):
+                        self.speaker.stop()
+                        if not speak_with_voice_reader(translated, translation_target):
+                            if self.speaker.available():
+                                self.speaker.speak(translated, language=translation_target)
+                            else:
+                                self._last_route_note += " Translation voice is unavailable."
+            if bool(self.config.get("assistant_answer_mode", False)) and not translate_this_take:
                 # Ask-gemma mode: the transcript is a question; route the
                 # model's answer instead of the transcript itself.
                 self._emit_transcript(f"Q: {transcript}", "recognized")
@@ -2744,6 +3025,27 @@ class RecorderController:
             # Surface transcript to UI immediately, even if insertion/clipboard routing fails.
             self._emit_transcript(display_text, "recognized")
             route = self._route_transcript(transcript)
+
+            # Keep a deterministic recovery path for every hotkey take. The
+            # paste-once fallback can temporarily become the Wayland clipboard
+            # owner, so publish the final transcript again after routing too.
+            if (
+                not self._started_from_gui
+                and bool(self.config.get("always_copy_hotkey_to_clipboard", True))
+            ):
+                if copy_to_clipboard(transcript):
+                    if self._last_route_note:
+                        self._last_route_note += " Transcript also copied to clipboard."
+                    else:
+                        self._last_route_note = "Transcript also copied to clipboard."
+                    log_routing("route: final hotkey clipboard copy succeeded")
+                else:
+                    self._last_route_note = (
+                        f"{self._last_route_note} Clipboard copy failed."
+                        if self._last_route_note
+                        else "Clipboard copy failed."
+                    )
+                    log_routing("route: final hotkey clipboard copy failed")
             self._emit_transcript(display_text, route)
 
             if self._capture_focus and not self._started_from_gui:
@@ -2779,9 +3081,16 @@ class RecorderController:
         finally:
             with self._lock:
                 self._transcribing = False
+                self._translate_next_recording = False
 
-    def _transcribe_audio_path(self, audio_path: Path) -> tuple[str, str | None]:
+    def _transcribe_audio_path(
+        self,
+        audio_path: Path,
+        force_whisper: bool = False,
+    ) -> tuple[str, str | None]:
         with self._transcriber_lock:
+            if force_whisper:
+                return self._transcribe_audio_whisper(audio_path)
             if self._engine() == "ollama":
                 return self._transcribe_audio_ollama(audio_path)
             if self._engine() == "gemma4-transformers":
@@ -2801,6 +3110,7 @@ class RecorderController:
         txt_path = Path(str(out_prefix) + ".txt")
         txt_path.unlink(missing_ok=True)
 
+        language = str(self.config.get("language", "auto")).strip() or "auto"
         cmd = [
             str(whisper_cli),
             "-m",
@@ -2811,7 +3121,7 @@ class RecorderController:
             "-of",
             str(out_prefix),
             "-l",
-            str(self.config.get("language", "en")),
+            language,
         ]
         if bool(self.config.get("no_gpu", True)):
             cmd.append("--no-gpu")
@@ -2886,7 +3196,10 @@ class RecorderController:
             # The base64 copy is in memory; the temp file is no longer needed.
             norm_path.unlink(missing_ok=True)
 
-        prompt = str(self.config.get("ollama_transcribe_prompt", DEFAULT_CONFIG["ollama_transcribe_prompt"]))
+        prompt = (
+            str(self.config.get("ollama_transcribe_prompt", DEFAULT_CONFIG["ollama_transcribe_prompt"]))
+            + " Preserve the original spoken language and Unicode script; do not translate or transliterate."
+        )
         payload = {
             "model": self.config.ollama_model(),
             "messages": [
@@ -2995,7 +3308,10 @@ class RecorderController:
             return "", f"Gemma 4 transcription failed: {exc}"
 
     def _gemma_messages_for_audio(self, audio_path: Path) -> list[dict[str, Any]]:
-        prompt = str(self.config.get("gemma_transcribe_prompt", DEFAULT_CONFIG["gemma_transcribe_prompt"]))
+        prompt = (
+            str(self.config.get("gemma_transcribe_prompt", DEFAULT_CONFIG["gemma_transcribe_prompt"]))
+            + " Preserve the original spoken language and Unicode script; do not translate or transliterate."
+        )
         # The current Transformers pipeline accepts local audio paths as strings.
         return [
             {
@@ -3139,6 +3455,15 @@ class RecorderController:
         text = re.sub(r"\s+", " ", text)
         return text.strip()
 
+    def _hotkey_direct_type_allowed(self, text: str) -> bool:
+        if not bool(self.config.get("direct_type_fallback_for_hotkey", True)):
+            return False
+        try:
+            max_chars = int(self.config.get("direct_type_max_chars_for_hotkey", 0))
+        except (TypeError, ValueError):
+            max_chars = 0
+        return max_chars > 0 and len(text) <= max_chars
+
     def _route_transcript(self, text: str) -> str:
         # If recording started from GUI button, prefer showing transcript in GUI only.
         if self._started_from_gui:
@@ -3150,10 +3475,10 @@ class RecorderController:
         # If initial capture missed the concrete accessible node, try to hydrate it now.
         if self._capture_focus and self._focus_target is None and self._focus_target_at_start is not None:
             candidate = capture_focus_target_for_hotkey(retries=6, delay_s=0.03)
-            self._remember_focus_target(candidate)
             if same_focus_target(candidate, self._focus_target_at_start):
                 self._focus_target = candidate
                 if candidate is not None:
+                    self._remember_focus_target(candidate)
                     log_routing(
                         "route: hydrated focus target from current focus "
                         f"app={candidate.source_app!r} pid={candidate.source_pid}"
@@ -3201,17 +3526,25 @@ class RecorderController:
                 if insert_text_into_target(self._focus_target, text):
                     log_routing("route: focused_target success")
                     return "focused_target"
-                # Re-activate at compositor level before paste attempt.
+                # Re-activate at compositor level before paste attempt. AT-SPI
+                # focus is useful when available, but must not gate the
+                # clipboard path: several Wayland apps expose no usable
+                # component interface even though Ctrl+V works normally.
                 activate_window_by_pid(self._focus_target.source_pid)
                 time.sleep(0.10)
-                if focus_target_element(self._focus_target):
-                    if paste_text_via_clipboard(
-                        text,
-                        restore_clipboard=bool(self.config.get("restore_clipboard_after_paste", True)),
-                        target=self._focus_target,
-                    ):
-                        log_routing("route: focused_target_pasted success")
-                        return "focused_target_pasted"
+                focus_target_element(self._focus_target)
+                if paste_text_via_clipboard(
+                    text,
+                    restore_clipboard=bool(self.config.get("restore_clipboard_after_paste", True)),
+                    target=self._focus_target,
+                ):
+                    log_routing("route: focused_target_pasted success")
+                    return "focused_target_pasted"
+                if self._hotkey_direct_type_allowed(text):
+                    activate_window_by_pid(self._focus_target.source_pid)
+                    if type_text_via_ydotool(text):
+                        log_routing("route: ydotool_typed success after focused-target paste failure")
+                        return "ydotool_typed"
                 log_routing("route: focused target delivery failed")
 
         # Strict focus lock: never inject into a different focused app when a lock target exists.
@@ -3258,7 +3591,7 @@ class RecorderController:
                         self._last_route_note = "Focus changed, but pasted to the original target after refocus."
                         log_routing("route: focused_target_pasted success after forced refocus")
                         return "focused_target_pasted"
-                    if bool(self.config.get("direct_type_fallback_for_hotkey", True)) and type_text_via_ydotool(text):
+                    if self._hotkey_direct_type_allowed(text) and type_text_via_ydotool(text):
                         self._last_route_note = "Focus changed, but typed into the original target after refocus."
                         log_routing("route: ydotool_typed success after forced refocus")
                         return "ydotool_typed"
@@ -3312,7 +3645,7 @@ class RecorderController:
                 log_routing("route: clipboard+pasted success")
                 return "clipboard+pasted"
 
-            if bool(self.config.get("direct_type_fallback_for_hotkey", True)):
+            if self._hotkey_direct_type_allowed(text):
                 if type_text_via_ydotool(text):
                     log_routing("route: ydotool_typed success")
                     return "ydotool_typed"
@@ -3604,9 +3937,25 @@ class VoiceTypingGui:
         self.elapsed_var = tk.StringVar(value="00:00")
         self.route_var = tk.StringVar(value="Target: none yet")
         self.engine_var = tk.StringVar(value=self.config.transcription_engine())
+        self.language_var = tk.StringVar(value=str(self.config.get("language", "auto")))
         self.model_var = tk.StringVar(value=str(self.config.get("model", "")))
         self.gemma_model_var = tk.StringVar(value=self.config.gemma_model_ref())
         self.ollama_model_var = tk.StringVar(value=self.config.ollama_model())
+        configured_context = str(self.config.get("ollama_context_tokens", 2048)).strip()
+        self.ollama_context_var = tk.StringVar(
+            value=configured_context
+            if configured_context in {"1024", "2048", "4096", "8192", "16384"}
+            else "2048"
+        )
+        self.dictation_translation_target_var = tk.StringVar(
+            value=str(self.config.get("dictation_translation_target_language", "English"))
+        )
+        self.dictation_translation_var = tk.BooleanVar(
+            value=bool(self.config.get("dictation_translation_enabled", False))
+        )
+        self.dictation_translation_speak_var = tk.BooleanVar(
+            value=bool(self.config.get("dictation_translation_speak_aloud", False))
+        )
 
         self.controller = RecorderController(
             config=self.config,
@@ -3642,8 +3991,9 @@ class VoiceTypingGui:
     def _apply_window_presentation(self) -> None:
         try:
             controller = getattr(self, "controller", None)
-            is_recording = bool(controller is not None and controller.is_recording())
-            keep_on_top = bool(self.config.get("window_always_on_top", True)) or is_recording
+            # Recording must not turn the helper into a focus-stealing
+            # always-on-top window. The original target is tracked separately.
+            keep_on_top = bool(self.config.get("window_always_on_top", False))
             self.root.attributes("-topmost", keep_on_top)
         except Exception:
             pass
@@ -3716,6 +4066,37 @@ class VoiceTypingGui:
 
         self.toggle_btn = ttk.Button(self.status_bar, text="Record", style="VT.TButton", command=self._toggle_from_gui)
         self.toggle_btn.pack(side="right")
+        self.translate_btn = ttk.Button(
+            self.status_bar,
+            text="Translate take",
+            style="VT.Detail.TButton",
+            command=self._translate_from_gui,
+        )
+        self.translate_btn.pack(side="right", padx=(0, 6))
+        ttk.Label(self.status_bar, text="to", style="VT.Meta.TLabel").pack(side="right", padx=(8, 4))
+        self.translate_target_combo = ttk.Combobox(
+            self.status_bar,
+            textvariable=self.dictation_translation_target_var,
+            values=["English", "Hebrew", "French", "Italian"],
+            state="readonly",
+            width=9,
+        )
+        self.translate_target_combo.pack(side="right")
+        self.translate_target_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_options())
+        ttk.Checkbutton(
+            self.status_bar,
+            text="Translate",
+            variable=self.dictation_translation_var,
+            command=self._save_options,
+            style="VT.TCheckbutton",
+        ).pack(side="right", padx=(8, 0))
+        ttk.Checkbutton(
+            self.status_bar,
+            text="Speak",
+            variable=self.dictation_translation_speak_var,
+            command=self._save_options,
+            style="VT.TCheckbutton",
+        ).pack(side="right", padx=(8, 0))
         ttk.Button(self.status_bar, text="Settings", style="VT.TButton", command=self._toggle_settings).pack(
             side="right", padx=(0, 6)
         )
@@ -3822,6 +4203,23 @@ class VoiceTypingGui:
             side="left"
         )
 
+        language_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
+        language_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(language_row, text="Speech language:", style="VT.Meta.TLabel").pack(side="left")
+        language_combo = ttk.Combobox(
+            language_row,
+            textvariable=self.language_var,
+            values=["auto", "en", "he", "fr", "it"],
+            width=10,
+        )
+        language_combo.pack(side="left", padx=(6, 0))
+        language_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_options())
+        ttk.Label(
+            language_row,
+            text="auto preserves the language/script; use a multilingual Whisper model",
+            style="VT.Meta.TLabel",
+        ).pack(side="left", padx=(8, 0))
+
         gemma_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
         gemma_row.pack(fill="x", pady=(0, 4))
         ttk.Label(gemma_row, text="Gemma:", style="VT.Meta.TLabel").pack(side="left")
@@ -3844,16 +4242,37 @@ class VoiceTypingGui:
             side="left"
         )
 
+        context_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
+        context_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(context_row, text="Ollama context tokens:", style="VT.Meta.TLabel").pack(side="left")
+        context_combo = ttk.Combobox(
+            context_row,
+            textvariable=self.ollama_context_var,
+            values=["1024", "2048", "4096", "8192", "16384"],
+            state="readonly",
+            width=8,
+        )
+        context_combo.pack(side="left", padx=(6, 8))
+        context_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_options())
+        ttk.Label(
+            context_row,
+            text="lower values use less VRAM; 2048 is a good RTX 8 GB starting point",
+            style="VT.Meta.TLabel",
+        ).pack(side="left")
+
         self.auto_paste_var = tk.BooleanVar(value=bool(self.config.get("auto_paste_current_focus", False)))
         self.gui_clipboard_var = tk.BooleanVar(
             value=bool(self.config.get("copy_to_clipboard_when_started_from_gui", False))
         )
-        self.always_on_top_var = tk.BooleanVar(value=bool(self.config.get("window_always_on_top", True)))
+        self.always_on_top_var = tk.BooleanVar(value=bool(self.config.get("window_always_on_top", False)))
         self.show_on_hotkey_var = tk.BooleanVar(value=bool(self.config.get("show_panel_on_hotkey_start", True)))
         self.use_gpu_var = tk.BooleanVar(value=not bool(self.config.get("no_gpu", True)))
         self.streaming_var = tk.BooleanVar(value=bool(self.config.get("streaming_transcription", False)))
         self.voice_commands_var = tk.BooleanVar(value=bool(self.config.get("voice_commands_enabled", True)))
         self.speak_answers_var = tk.BooleanVar(value=bool(self.config.get("answer_speak_aloud", True)))
+        self.always_copy_hotkey_var = tk.BooleanVar(
+            value=bool(self.config.get("always_copy_hotkey_to_clipboard", True))
+        )
 
         ttk.Checkbutton(
             options_frame,
@@ -3867,6 +4286,14 @@ class VoiceTypingGui:
             options_frame,
             text="GUI-start recordings also copy to clipboard",
             variable=self.gui_clipboard_var,
+            command=self._save_options,
+            style="VT.TCheckbutton",
+        ).pack(anchor="w", pady=(2, 0))
+
+        ttk.Checkbutton(
+            options_frame,
+            text="Always copy hotkey results to clipboard",
+            variable=self.always_copy_hotkey_var,
             command=self._save_options,
             style="VT.TCheckbutton",
         ).pack(anchor="w", pady=(2, 0))
@@ -4049,6 +4476,7 @@ class VoiceTypingGui:
         notify("Voice typing", f"Ollama model set to {model_ref}")
 
     def _save_options(self) -> None:
+        self.config.set("language", self.language_var.get().strip() or "auto")
         self.config.set("auto_paste_current_focus", bool(self.auto_paste_var.get()))
         self.config.set(
             "copy_to_clipboard_when_started_from_gui",
@@ -4057,15 +4485,46 @@ class VoiceTypingGui:
         self.config.set("window_always_on_top", bool(self.always_on_top_var.get()))
         self.config.set("show_panel_on_hotkey_start", bool(self.show_on_hotkey_var.get()))
         self.config.set("no_gpu", not bool(self.use_gpu_var.get()))
+        try:
+            context_tokens = max(512, min(262144, int(self.ollama_context_var.get().strip())))
+        except (TypeError, ValueError):
+            context_tokens = 2048
+        self.config.set("ollama_context_tokens", context_tokens)
         self.config.set("streaming_transcription", bool(self.streaming_var.get()))
         self.config.set("voice_commands_enabled", bool(self.voice_commands_var.get()))
         self.config.set("answer_speak_aloud", bool(self.speak_answers_var.get()))
+        self.config.set("always_copy_hotkey_to_clipboard", bool(self.always_copy_hotkey_var.get()))
+        self.config.set("dictation_translation_enabled", bool(self.dictation_translation_var.get()))
+        self.config.set(
+            "dictation_translation_target_language",
+            self.dictation_translation_target_var.get().strip() or "English",
+        )
+        self.config.set(
+            "dictation_translation_speak_aloud",
+            bool(self.dictation_translation_speak_var.get()),
+        )
         self._apply_window_presentation()
 
     def _toggle_from_gui(self) -> None:
         ok, message = self.controller.toggle_recording(capture_focus=False, started_from_gui=True)
         if not ok:
             self.status_var.set(message)
+            notify("Voice typing", message, urgency="critical")
+
+    def _translate_from_gui(self) -> None:
+        """Start a one-shot Whisper -> Gemma translation take."""
+        if self.controller.is_recording():
+            ok, message = self.controller.stop_recording_async(reason="manual_stop")
+        else:
+            self._save_options()
+            ok, message = self.controller.start_translation_recording(
+                capture_focus=True,
+                started_from_gui=False,
+            )
+            if ok:
+                self.controller.restore_original_focus_target(max_age_seconds=10.0)
+        self.status_var.set(message)
+        if not ok:
             notify("Voice typing", message, urgency="critical")
 
     def _stop_from_gui(self) -> None:
@@ -4180,8 +4639,10 @@ class VoiceTypingGui:
                 }.get(route, "Transcript processed.")
                 self.status_var.set(route_label)
                 self.route_var.set(route_label)
-                # Keep focus on the original target even while GUI stays visible.
-                self._schedule_post_transcript_focus_restore()
+                # Focus is restored by the delivery thread after routing. Do
+                # not schedule GUI-thread focus timers here: the preview event
+                # arrives before paste, and the final event may arrive after
+                # the user has intentionally moved to another application.
 
             if event == "show":
                 self._show_window(active=bool(meta) if meta is not None else True)
@@ -4255,21 +4716,9 @@ class VoiceTypingGui:
         for delay_ms in (80, 220, 500, 900):
             self.root.after(delay_ms, self._restore_external_focus_after_hotkey_show)
 
-    def _schedule_post_transcript_focus_restore(self) -> None:
-        # After transcript routing, reaffirm original target focus at multiple
-        # intervals to handle varying compositor timing.
-        for delay_ms in (40, 150, 350, 600, 1000):
-            self.root.after(delay_ms, self._restore_original_focus_after_transcript)
-
     def _restore_external_focus_after_hotkey_show(self) -> None:
         try:
             self.controller.restore_last_external_focus(max_age_seconds=1.0)
-        except Exception:
-            pass
-
-    def _restore_original_focus_after_transcript(self) -> None:
-        try:
-            self.controller.restore_original_focus_target(max_age_seconds=12.0)
         except Exception:
             pass
 
@@ -4405,25 +4854,22 @@ def cmd_toggle() -> int:
         print("Ignored duplicate toggle")
         return 0
 
-    # Capture focus target NOW (before any IPC delay) so the GUI server
-    # gets the best possible hint about which window/field was active
-    # when the hotkey was pressed.
+    # The running GUI already has a 50ms focus tracker. Send the hotkey to it
+    # first; doing an AT-SPI tree scan in this launcher made recording start
+    # visibly late.
     focus_hint: dict[str, Any] | None = None
+    resp = send_ipc_with_retries({"cmd": "toggle"}, attempts=1, timeout=0.45)
+    if resp is not None:
+        print(resp.get("message", "ok"))
+        return 0 if resp.get("ok", False) else 1
+
+    # No running server: capture once to seed a newly launched GUI.
     try:
-        target = capture_focus_target_for_hotkey(retries=4, delay_s=0.02)
+        target = capture_focus_target_for_hotkey(retries=1, delay_s=0.0)
         if target is not None:
             focus_hint = focus_target_to_hint(target)
     except Exception:
         pass
-
-    ipc_req: dict[str, Any] = {"cmd": "toggle"}
-    if focus_hint is not None:
-        ipc_req["focus_hint"] = focus_hint
-
-    resp = send_ipc_with_retries(ipc_req, attempts=1, timeout=0.45)
-    if resp is not None:
-        print(resp.get("message", "ok"))
-        return 0 if resp.get("ok", False) else 1
 
     # If socket exists but we can't talk to it, avoid spawning duplicate windows.
     if os.path.exists(SOCKET_PATH):
@@ -4443,13 +4889,16 @@ def cmd_toggle() -> int:
         return 1
     try:
         # Another invocation may have already started the server while we waited for lock.
-        resp_after_lock = send_ipc_with_retries({"cmd": "toggle"}, attempts=2, timeout=0.7)
+        retry_request: dict[str, Any] = {"cmd": "toggle"}
+        if focus_hint is not None:
+            retry_request["focus_hint"] = focus_hint
+        resp_after_lock = send_ipc_with_retries(retry_request, attempts=2, timeout=0.7)
         if resp_after_lock is not None:
             print(resp_after_lock.get("message", "ok"))
             return 0 if resp_after_lock.get("ok", False) else 1
 
         # GUI server isn't up yet. Start it and immediately begin recording.
-        spawn_gui_with_optional_toggle(toggle_on_launch=True, focus_hint=None)
+        spawn_gui_with_optional_toggle(toggle_on_launch=True, focus_hint=focus_hint)
         print("Started GUI and began recording")
         return 0
     finally:
@@ -4466,34 +4915,46 @@ def cmd_status() -> int:
 
 
 def cmd_start() -> int:
+    focus_hint: dict[str, Any] | None = None
     resp = send_ipc_with_retries({"cmd": "start"}, attempts=1, timeout=0.45)
-    if resp is None:
-        if os.path.exists(SOCKET_PATH):
-            _, err = send_ipc_raw({"cmd": "status"}, timeout=1.0)
-            if isinstance(err, socket.timeout):
-                print("Voice typing controller is busy, try again")
-                return 1
-            if isinstance(err, ConnectionRefusedError):
-                try:
-                    os.unlink(SOCKET_PATH)
-                except Exception:
-                    pass
-        lock_file = _acquire_spawn_lock(timeout_seconds=1.5)
-        if lock_file is None:
-            print("Voice typing is already starting, try again")
+    if resp is not None:
+        print(resp.get("message", "ok"))
+        return 0 if resp.get("ok", False) else 1
+
+    try:
+        target = capture_focus_target_for_hotkey(retries=1, delay_s=0.0)
+        if target is not None:
+            focus_hint = focus_target_to_hint(target)
+    except Exception:
+        pass
+
+    request: dict[str, Any] = {"cmd": "start"}
+    if focus_hint is not None:
+        request["focus_hint"] = focus_hint
+    if os.path.exists(SOCKET_PATH):
+        _, err = send_ipc_raw({"cmd": "status"}, timeout=1.0)
+        if isinstance(err, socket.timeout):
+            print("Voice typing controller is busy, try again")
             return 1
-        try:
-            resp_after_lock = send_ipc_with_retries({"cmd": "start"}, attempts=2, timeout=0.7)
-            if resp_after_lock is None:
-                spawn_gui_with_optional_toggle(toggle_on_launch=True, focus_hint=None)
-                print("Started GUI and began recording")
-                return 0
-            print(resp_after_lock.get("message", "ok"))
-            return 0 if resp_after_lock.get("ok", False) else 1
-        finally:
-            _release_spawn_lock(lock_file)
-    print(resp.get("message", "ok"))
-    return 0 if resp.get("ok", False) else 1
+        if isinstance(err, ConnectionRefusedError):
+            try:
+                os.unlink(SOCKET_PATH)
+            except Exception:
+                pass
+    lock_file = _acquire_spawn_lock(timeout_seconds=1.5)
+    if lock_file is None:
+        print("Voice typing is already starting, try again")
+        return 1
+    try:
+        resp_after_lock = send_ipc_with_retries(request, attempts=2, timeout=0.7)
+        if resp_after_lock is None:
+            spawn_gui_with_optional_toggle(toggle_on_launch=True, focus_hint=focus_hint)
+            print("Started GUI and began recording")
+            return 0
+        print(resp_after_lock.get("message", "ok"))
+        return 0 if resp_after_lock.get("ok", False) else 1
+    finally:
+        _release_spawn_lock(lock_file)
 
 
 def cmd_stop() -> int:
