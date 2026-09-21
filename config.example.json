@@ -54,5 +54,10 @@
   "direct_type_max_chars_for_hotkey": 0,
   "paste_fallback_for_hotkey": true,
   "restore_clipboard_after_paste": true,
-  "window_always_on_top": false
+  "paste_shortcut_overrides": {},
+  "window_always_on_top": false,
+  "indicator_enabled": true,
+  "indicator_position": "bottom",
+  "indicator_show_result": true,
+  "studio_normal_window": false
 }

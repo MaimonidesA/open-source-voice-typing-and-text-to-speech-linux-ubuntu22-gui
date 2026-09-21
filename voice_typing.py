@@ -32,9 +32,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-import tkinter as tk
-from tkinter import messagebox, ttk
-
 try:
     import pyatspi  # type: ignore
 except Exception:
@@ -78,6 +75,19 @@ SPAWN_LOCK_PATH = "/tmp/voice_typing_spawn.lock"
 TOGGLE_DEBOUNCE_PATH = "/tmp/voice_typing_toggle.debounce"
 TOGGLE_DEBOUNCE_SECONDS = 0.8
 MIN_HOTKEY_RECORDING_SECONDS_BEFORE_STOP = 1.5
+FOCUS_TRACKER_INTERVAL_SECONDS = 0.1
+# A tracker snapshot this fresh is used as the hotkey start target.
+START_FOCUS_SNAPSHOT_MAX_AGE_SECONDS = 0.35
+# Time for mutter to announce a new X11 clipboard owner to Wayland apps.
+X11_CLIPBOARD_SETTLE_SECONDS = 0.15
+# wl-copy/wl-paste map a focus-taking window on GNOME; wait for focus to return.
+WL_CLIPBOARD_FOCUS_SETTLE_SECONDS = 0.35
+FOCUSED_NODE_SEARCH_LIMIT = 1500
+PASTE_SHORTCUT_KEYS: dict[str, list[str]] = {
+    "ctrl+v": ["29:1", "47:1", "47:0", "29:0"],
+    "ctrl+shift+v": ["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
+    "shift+insert": ["42:1", "110:1", "110:0", "42:0"],
+}
 GEMMA4_MAX_AUDIO_SECONDS = 30
 SUPPORTED_TRANSCRIPTION_ENGINES = ("whisper", "ollama", "gemma4-transformers")
 ENGINE_ALIASES = {
@@ -205,6 +215,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "direct_type_max_chars_for_hotkey": 0,
     "paste_fallback_for_hotkey": True,
     "restore_clipboard_after_paste": False,
+    # Per-app paste shortcut, keyed by AT-SPI app name, e.g. {"code": "ctrl+shift+v"}.
+    # Default: ctrl+shift+v for terminals, ctrl+v for everything else.
+    "paste_shortcut_overrides": {},
     "window_always_on_top": False,
     "show_panel_on_hotkey_start": True,
     "window_opacity": 0.95,
@@ -276,6 +289,9 @@ class FocusTarget:
     source_app: str
     source_pid: int | None = None
     source_signature: str = ""
+    # "<pid>:<AT-SPI path>" of the active top-level window; stable while the
+    # window lives, even when its title changes.
+    window_key: str = ""
 
 
 class ConfigManager:
@@ -661,7 +677,13 @@ def parse_voice_command(text: str, prefixes: list[str]) -> tuple[str, str] | Non
     return None
 
 
-def _find_focused_accessible(node: Any) -> Any | None:
+def _find_focused_accessible(node: Any, budget: list[int] | None = None) -> Any | None:
+    # budget is a one-item node counter shared across the recursion; each node
+    # costs a D-Bus round trip, and browser trees can have thousands.
+    if budget is not None:
+        if budget[0] <= 0:
+            return None
+        budget[0] -= 1
     try:
         state = node.getState()
         if state and state.contains(pyatspi.STATE_FOCUSED):
@@ -679,10 +701,31 @@ def _find_focused_accessible(node: Any) -> Any | None:
             child = node.getChildAtIndex(index)
         except Exception:
             continue
-        found = _find_focused_accessible(child)
+        found = _find_focused_accessible(child, budget)
         if found is not None:
             return found
     return None
+
+
+_ATSPI_APP_NAME_CACHE: dict[int, str] = {}
+
+
+def _atspi_app_name(app: Any, pid: int | None) -> str:
+    # gnome-shell takes 20-100ms to answer a name query and a pid's app name
+    # never changes, so ask each app once.
+    if pid is not None:
+        cached = _ATSPI_APP_NAME_CACHE.get(pid)
+        if cached is not None:
+            return cached
+    try:
+        name = str(getattr(app, "name", "") or "")
+    except Exception:
+        name = ""
+    if pid is not None and name:
+        if len(_ATSPI_APP_NAME_CACHE) > 512:
+            _ATSPI_APP_NAME_CACHE.clear()
+        _ATSPI_APP_NAME_CACHE[pid] = name
+    return name
 
 
 def _app_process_id(app: Any) -> int | None:
@@ -690,14 +733,6 @@ def _app_process_id(app: Any) -> int | None:
         return int(app.get_process_id())
     except Exception:
         return None
-
-
-def _app_is_active(app: Any) -> bool:
-    try:
-        state = app.getState()
-        return bool(state and state.contains(pyatspi.STATE_ACTIVE))
-    except Exception:
-        return False
 
 
 def _is_non_target_app_name(name: str) -> bool:
@@ -716,6 +751,7 @@ def focus_target_to_hint(target: FocusTarget | None) -> dict[str, Any] | None:
         "source_app": target.source_app,
         "source_pid": target.source_pid,
         "source_signature": target.source_signature,
+        "window_key": target.window_key,
     }
 
 
@@ -732,7 +768,14 @@ def focus_target_from_hint(hint: dict[str, Any] | None) -> FocusTarget | None:
     elif isinstance(pid_raw, str) and pid_raw.strip().isdigit():
         pid = int(pid_raw.strip())
     sig = str(hint.get("source_signature", "") or "")
-    return FocusTarget(accessible=None, source_app=app, source_pid=pid, source_signature=sig)
+    window_key = str(hint.get("window_key", "") or "")
+    return FocusTarget(
+        accessible=None,
+        source_app=app,
+        source_pid=pid,
+        source_signature=sig,
+        window_key=window_key,
+    )
 
 
 def capture_focus_target_for_hotkey(retries: int = 8, delay_s: float = 0.04) -> FocusTarget | None:
@@ -777,6 +820,10 @@ def _common_prefix_len(parts_a: list[str], parts_b: list[str]) -> int:
 def same_focus_target(a: FocusTarget | None, b: FocusTarget | None) -> bool:
     if a is None and b is None:
         return True
+    # Window identity is exact; the tolerant matching below is for hints
+    # that predate it.
+    if a is not None and b is not None and a.window_key and b.window_key:
+        return a.window_key == b.window_key
     pid_a, app_a, sig_a = focus_signature(a)
     pid_b, app_b, sig_b = focus_signature(b)
 
@@ -814,6 +861,12 @@ def has_focus_target_identity(target: FocusTarget | None) -> bool:
     if (target.source_signature or "").strip():
         return True
     return False
+
+
+def _describe_focus_target(target: FocusTarget | None) -> str:
+    if target is None:
+        return "none"
+    return f"{target.source_app!r}/{target.window_key or target.source_pid}"
 
 
 def _accessible_signature(node: Any, depth_limit: int = 8) -> str:
@@ -936,55 +989,62 @@ def resolve_focus_target_from_hint(hint: FocusTarget | None) -> FocusTarget | No
 
 
 def capture_focus_target() -> FocusTarget | None:
+    """Return the window that has keyboard focus, with its focused element.
+
+    Only an app's ACTIVE top-level window counts. gnome-terminal and other
+    GTK apps keep a FOCUSED widget inside background windows, so searching
+    for FOCUSED alone reported a background terminal while the user typed in
+    VS Code. Apps that expose windows but not widgets (VS Code, other
+    Electron apps) yield a target with window_key and accessible=None.
+    """
     if pyatspi is None:
         return None
 
     try:
         desktop = pyatspi.Registry.getDesktop(0)
+        app_count = int(desktop.childCount)
     except Exception:
         return None
 
-    try:
-        app_count = int(desktop.childCount)
-    except Exception:
-        app_count = 0
-
-    candidates: list[tuple[int, FocusTarget]] = []
     own_pid = os.getpid()
-
     for index in range(app_count):
         try:
             app = desktop.getChildAtIndex(index)
         except Exception:
             continue
-        found = _find_focused_accessible(app)
-        if found is not None:
-            app_name = getattr(app, "name", "unknown") or "unknown"
-            app_pid = _app_process_id(app)
-            target = FocusTarget(
-                accessible=found,
-                source_app=app_name,
+        if app is None:
+            continue
+        app_pid = _app_process_id(app)
+        if app_pid is not None and app_pid == own_pid:
+            continue
+        app_name = _atspi_app_name(app, app_pid)
+        if _is_non_target_app_name(app_name):
+            continue
+        try:
+            window_count = int(app.childCount)
+        except Exception:
+            continue
+        for window_index in range(window_count):
+            try:
+                window = app.getChildAtIndex(window_index)
+                state = window.getState()
+                if not (state and state.contains(pyatspi.STATE_ACTIVE)):
+                    continue
+            except Exception:
+                continue
+            try:
+                window_path = str(getattr(window, "path", "") or "")
+            except Exception:
+                window_path = ""
+            focused = _find_focused_accessible(window, budget=[FOCUSED_NODE_SEARCH_LIMIT])
+            return FocusTarget(
+                accessible=focused,
+                source_app=app_name or "unknown",
                 source_pid=app_pid,
-                source_signature=_accessible_signature(found),
+                source_signature=_accessible_signature(focused) if focused is not None else "",
+                window_key=f"{app_pid}:{window_path or window_index}",
             )
-
-            # Rank targets: active apps first, and prefer non-self process.
-            rank = 0
-            if not _app_is_active(app):
-                rank += 10
-            if app_pid is not None and app_pid == own_pid:
-                rank += 5
-            if _is_non_target_app_name(app_name):
-                rank += 100
-            candidates.append((rank, target))
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item[0])
-    chosen = candidates[0][1]
-    if _is_non_target_app_name(chosen.source_app):
-        return None
-    return chosen
+    return None
 
 
 def insert_text_into_target(target: FocusTarget, text: str) -> bool:
@@ -1020,11 +1080,53 @@ def focus_target_element(target: FocusTarget) -> bool:
         return False
 
 
+_SHELL_EVAL_AVAILABLE: bool | None = None
+
+
+def _shell_eval_available() -> bool:
+    """GNOME Shell 41+ answers Eval with (false, '') outside unsafe mode, so
+    window activation through it is a no-op; probe once instead of paying a
+    gdbus round trip on every focus restore."""
+    global _SHELL_EVAL_AVAILABLE
+    if _SHELL_EVAL_AVAILABLE is not None:
+        return _SHELL_EVAL_AVAILABLE
+    if shutil.which("gdbus") is None:
+        _SHELL_EVAL_AVAILABLE = False
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "gdbus", "call", "--session",
+                "--dest", "org.gnome.Shell",
+                "--object-path", "/org/gnome/Shell",
+                "--method", "org.gnome.Shell.Eval",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+    except Exception:
+        return True  # transient; let the real call decide
+    reply = (result.stdout or "").strip()
+    if result.returncode == 0 and reply.startswith("(false"):
+        _SHELL_EVAL_AVAILABLE = False
+        log_routing("gdbus: Shell.Eval is disabled; window activation is unavailable")
+        return False
+    if result.returncode == 0 and reply.startswith("(true"):
+        _SHELL_EVAL_AVAILABLE = True
+        return True
+    return True
+
+
 def activate_window_by_pid(pid: int | None) -> bool:
     """Activate a window by PID using GNOME Shell D-Bus eval (compositor-level focus)."""
     if pid is None:
         return False
     if shutil.which("gdbus") is None:
+        return False
+    if not _shell_eval_available():
         return False
     js = (
         f"(function() {{"
@@ -1067,6 +1169,9 @@ def activate_window_by_query(query: str) -> bool:
     if not query:
         return False
     if shutil.which("gdbus") is None:
+        return False
+    if not _shell_eval_available():
+        log_routing(f"gdbus: cannot focus window for query={query!r} (Shell.Eval disabled)")
         return False
     quoted_query = json.dumps(query)
     js = (
@@ -1264,8 +1369,65 @@ def format_window_list_for_speech(windows: list[dict[str, Any]]) -> str:
 
 
 def copy_to_clipboard(text: str) -> bool:
+    return _set_clipboard(text) is not None
+
+
+def _set_clipboard(text: str) -> str | None:
+    """Publish text as the clipboard; returns the backend used ("x11" or
+    "wayland") or None on failure."""
+    if _copy_via_x11_clipboard(text):
+        return "x11"
     ok, _ = _offer_clipboard_text(text, paste_once=False)
-    return ok
+    return "wayland" if ok else None
+
+
+def _copy_via_x11_clipboard(text: str) -> bool:
+    """Own the clipboard through Xwayland with xclip.
+
+    GNOME has no wlr-data-control, so wl-copy/wl-paste reach the clipboard
+    by mapping a tiny window of their own, which takes keyboard focus from
+    the user's text box for a moment. An X11 client owns the selection with
+    no window at all, and mutter hands it to Wayland apps like any copy.
+    """
+    if not os.environ.get("DISPLAY") or shutil.which("xclip") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-in"],
+            input=text.encode("utf-8"),
+            # xclip forks a child that keeps serving the selection; it must
+            # not inherit pipes we would wait on.
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+            check=False,
+        )
+    except Exception as exc:
+        log_routing(f"xclip copy failed ({exc})")
+        return False
+    if result.returncode != 0:
+        log_routing(f"xclip copy failed (rc={result.returncode})")
+        return False
+
+    expected = _normalize_clip_text(text)
+    for _ in range(5):
+        try:
+            current = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-out"],
+                capture_output=True,
+                timeout=0.3,
+                check=False,
+            )
+            if (
+                current.returncode == 0
+                and _normalize_clip_text(current.stdout.decode("utf-8", errors="replace")) == expected
+            ):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.02)
+    log_routing("xclip did not publish expected clipboard content")
+    return False
 
 
 def read_clipboard_text() -> str | None:
@@ -1423,21 +1585,27 @@ def _is_terminal_like_focus(target: FocusTarget | None) -> bool:
     return "terminal" in sig
 
 
-def paste_current_focus_via_ydotool(target: FocusTarget | None = None) -> bool:
+def paste_current_focus_via_ydotool(target: FocusTarget | None = None, shortcut: str | None = None) -> bool:
     if shutil.which("ydotool") is None:
         return False
 
-    # Terminals often require Ctrl+Shift+V instead of Ctrl+V.
-    key_sequences: list[list[str]] = []
-    if _is_terminal_like_focus(target):
-        key_sequences.append(["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"])
-        key_sequences.append(["ydotool", "key", "42:1", "110:1", "110:0", "42:0"])  # Shift+Insert
+    if shortcut in PASTE_SHORTCUT_KEYS:
+        shortcuts = [shortcut]
+    elif _is_terminal_like_focus(target):
+        # Terminals often require Ctrl+Shift+V instead of Ctrl+V.
+        shortcuts = ["ctrl+shift+v", "shift+insert"]
     else:
-        key_sequences.append(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])  # Ctrl+V
+        shortcuts = ["ctrl+v"]
 
-    for seq in key_sequences:
-        ok, detail = _run_ydotool_command(seq, timeout=1.5)
+    for name in shortcuts:
+        # ydotool's default 12ms key delay occasionally delivered a bare "v"
+        # (Ctrl lost) in testing; 30ms did not.
+        ok, detail = _run_ydotool_command(
+            ["ydotool", "key", "-d", "30", *PASTE_SHORTCUT_KEYS[name]],
+            timeout=1.5,
+        )
         if ok:
+            log_routing(f"ydotool: sent {name}")
             return True
         log_routing(f"ydotool paste failed ({detail})")
     return False
@@ -1460,29 +1628,27 @@ def type_text_via_ydotool(text: str) -> bool:
     return False
 
 
-def paste_text_via_clipboard(text: str, restore_clipboard: bool, target: FocusTarget | None = None) -> bool:
-    ok, offer_proc = _offer_clipboard_text(text, paste_once=True)
-    if not ok:
+def paste_text_via_clipboard(
+    text: str,
+    restore_clipboard: bool,
+    target: FocusTarget | None = None,
+    shortcut: str | None = None,
+) -> bool:
+    """Put text on the clipboard, then send the paste shortcut to whatever
+    has keyboard focus. The transcript stays on the clipboard afterwards.
+
+    The old paste-once offer could not tell whether the paste landed:
+    wl-copy forks and its parent exits at once, and mutter's clipboard
+    manager consumes the single offer itself.
+    """
+    backend = _set_clipboard(text)
+    if backend is None:
         return False
-    time.sleep(0.02)
-    if not paste_current_focus_via_ydotool(target=target):
-        if offer_proc is not None:
-            try:
-                offer_proc.terminate()
-            except Exception:
-                pass
+    # Wayland apps learn about a new X11 owner asynchronously; the wl-copy
+    # fallback also has to wait for its focus-taking window to hand focus back.
+    time.sleep(X11_CLIPBOARD_SETTLE_SECONDS if backend == "x11" else WL_CLIPBOARD_FOCUS_SETTLE_SECONDS)
+    if not paste_current_focus_via_ydotool(target=target, shortcut=shortcut):
         return False
-    if offer_proc is not None:
-        try:
-            offer_proc.wait(timeout=1.4)
-        except subprocess.TimeoutExpired:
-            # Paste likely did not happen if clipboard offer was never consumed.
-            try:
-                offer_proc.terminate()
-            except Exception:
-                pass
-            log_routing("clipboard offer was not consumed after paste shortcut")
-            return False
     if restore_clipboard:
         # Restoring immediately can race Ctrl+V in target apps and paste stale content.
         log_routing("clipboard restore skipped to avoid stale-paste race")
@@ -1657,6 +1823,11 @@ class RecorderController:
         self._transcribing = False
         self._last_known_focus_target: FocusTarget | None = None
         self._last_known_focus_at = 0.0
+        # Latest tracker scan, including "no accessible window is active".
+        self._focus_snapshot: FocusTarget | None = None
+        self._focus_snapshot_at = 0.0
+        # Text the hotkey route already left on the clipboard.
+        self._clipboard_text: str | None = None
         self._last_transcript: str = ""
         self._recording_mode = "single"
         self._translate_next_recording = False
@@ -1709,15 +1880,33 @@ class RecorderController:
         return target
 
     def _focus_tracker_loop(self) -> None:
-        # Track last real external focus so hotkeys that briefly steal focus still
-        # have a stable start target.  Poll aggressively (50ms) so the cached
-        # target is almost always fresh when a hotkey fires.
+        # Track the focused window so a hotkey can read its start target
+        # without an AT-SPI scan in the IPC thread. A scan takes ~10ms.
         while True:
-            time.sleep(0.05)
-            candidate = capture_focus_target()
+            time.sleep(FOCUS_TRACKER_INTERVAL_SECONDS)
+            try:
+                candidate = capture_focus_target()
+            except Exception:
+                continue
+            with self._lock:
+                self._focus_snapshot = candidate
+                self._focus_snapshot_at = time.time()
             if candidate is None:
                 continue
             self._remember_focus_target(candidate)
+
+    def _start_focus_snapshot(self) -> FocusTarget | None:
+        """Focused window at this moment; None means no accessible window is
+        active (desktop, shell, an app without AT-SPI, or this panel)."""
+        with self._lock:
+            snapshot = self._focus_snapshot
+            seen_at = self._focus_snapshot_at
+        if seen_at and time.time() - seen_at <= START_FOCUS_SNAPSHOT_MAX_AGE_SECONDS:
+            return snapshot
+        return capture_focus_target()
+
+    def current_focus_hint(self) -> dict[str, Any] | None:
+        return focus_target_to_hint(self._start_focus_snapshot())
 
     def restore_last_external_focus(self, max_age_seconds: float = 8.0) -> bool:
         target = self._recent_focus_target(max_age_seconds=max_age_seconds)
@@ -2270,7 +2459,7 @@ class RecorderController:
         focus_target: FocusTarget | None,
         focus_target_at_start_hint: FocusTarget | None = None,
     ) -> tuple[bool, str]:
-        cached_focus_for_start = self._recent_focus_target(max_age_seconds=0.75) if capture_focus else None
+        cached_focus_for_start = self._start_focus_snapshot() if capture_focus and focus_target is None else None
         captured_focus_for_memory: FocusTarget | None = None
         used_recent_focus_cache = False
         with self._lock:
@@ -2373,7 +2562,7 @@ class RecorderController:
             log_routing(
                 "start_recording: recovered target from focus tracker "
                 f"app={self._focus_target.source_app!r} pid={self._focus_target.source_pid} "
-                f"sig={self._focus_target.source_signature[:120]!r}"
+                f"win={self._focus_target.window_key!r} sig={self._focus_target.source_signature[:120]!r}"
             )
         elif self._focus_target is None and self._focus_target_at_start is None:
             # The global shortcut can briefly leave AT-SPI without a focused
@@ -2392,7 +2581,7 @@ class RecorderController:
             log_routing(
                 "start_recording: captured target "
                 f"app={self._focus_target.source_app!r} pid={self._focus_target.source_pid} "
-                f"sig={self._focus_target.source_signature[:120]!r}"
+                f"win={self._focus_target.window_key!r} sig={self._focus_target.source_signature[:120]!r}"
             )
 
         notify("Voice typing", "Recording started")
@@ -2946,6 +3135,7 @@ class RecorderController:
             with self._lock:
                 translate_this_take = self._translate_next_recording
                 self._last_route_note = ""
+            self._clipboard_text = None
             if not AUDIO_PATH.exists() or AUDIO_PATH.stat().st_size == 0:
                 notify("Voice typing", "No audio captured")
                 return False, "No audio captured"
@@ -3033,7 +3223,9 @@ class RecorderController:
                 not self._started_from_gui
                 and bool(self.config.get("always_copy_hotkey_to_clipboard", True))
             ):
-                if copy_to_clipboard(transcript):
+                # Skip re-publishing text the route already left there: a new
+                # owner right after Ctrl+V can race the app reading the paste.
+                if self._clipboard_text == transcript or copy_to_clipboard(transcript):
                     if self._last_route_note:
                         self._last_route_note += " Transcript also copied to clipboard."
                     else:
@@ -3472,200 +3664,130 @@ class RecorderController:
                     return "clipboard"
             return "gui_only"
 
-        # If initial capture missed the concrete accessible node, try to hydrate it now.
-        if self._capture_focus and self._focus_target is None and self._focus_target_at_start is not None:
-            candidate = capture_focus_target_for_hotkey(retries=6, delay_s=0.03)
-            if same_focus_target(candidate, self._focus_target_at_start):
-                self._focus_target = candidate
-                if candidate is not None:
-                    self._remember_focus_target(candidate)
-                    log_routing(
-                        "route: hydrated focus target from current focus "
-                        f"app={candidate.source_app!r} pid={candidate.source_pid}"
-                    )
-            if self._focus_target is None:
-                resolved = resolve_focus_target_from_hint(self._focus_target_at_start)
-                if resolved is not None:
-                    self._focus_target = resolved
-                    log_routing(
-                        "route: hydrated focus target from saved hint "
-                        f"app={resolved.source_app!r} pid={resolved.source_pid}"
-                    )
-                    self._remember_focus_target(resolved)
+        # GNOME Wayland gives no way to re-activate another app's window, so
+        # delivery can only paste into whatever has focus now. Paste only when
+        # that is still the window the recording started in; otherwise leave
+        # the transcript on the clipboard.
+        start = (self._focus_target or self._focus_target_at_start) if self._capture_focus else None
+        current = self._delivery_focus_target()
+        restore_clipboard = bool(self.config.get("restore_clipboard_after_paste", True))
 
-        if (
-            self._capture_focus
-            and self._focus_target is None
-            and self._focus_target_at_start is None
-            and bool(self.config.get("ask_when_focus_uncertain", False))
-        ):
-            if copy_to_clipboard(text):
-                self._last_route_note = (
-                    "No reliable target window was captured; focus the target and use paste-last."
-                )
-                speak_prompt(
-                    "I could not identify the target window. Focus the window and say voice typing paste last.",
-                    bool(self.config.get("voice_prompts_enabled", False)),
-                )
-                log_routing("route: clipboard_only because focus target was uncertain")
-                return "clipboard_only"
+        same_window: bool | None
+        if start is None:
+            same_window = None
+        elif current is None:
+            same_window = False
+        elif start.window_key and current.window_key:
+            same_window = start.window_key == current.window_key
+        else:
+            same_window = same_focus_target(current, start)
+        log_routing(
+            f"route: start={_describe_focus_target(start)} "
+            f"current={_describe_focus_target(current)} same_window={same_window}"
+        )
 
-        if self._capture_focus and self._focus_target is not None:
-            # Ignore accidental self-target capture from the GUI process.
-            if self._focus_target.source_pid != os.getpid():
-                log_routing(
-                    "route: trying focused target "
-                    f"app={self._focus_target.source_app!r} pid={self._focus_target.source_pid}"
-                )
-                # Activate the target window at the compositor level FIRST,
-                # then use AT-SPI grabFocus for the specific element.
-                activate_window_by_pid(self._focus_target.source_pid)
-                time.sleep(0.08)
-                focus_target_element(self._focus_target)
-                time.sleep(0.05)
-                if insert_text_into_target(self._focus_target, text):
-                    log_routing("route: focused_target success")
-                    return "focused_target"
-                # Re-activate at compositor level before paste attempt. AT-SPI
-                # focus is useful when available, but must not gate the
-                # clipboard path: several Wayland apps expose no usable
-                # component interface even though Ctrl+V works normally.
-                activate_window_by_pid(self._focus_target.source_pid)
-                time.sleep(0.10)
-                focus_target_element(self._focus_target)
-                if paste_text_via_clipboard(
-                    text,
-                    restore_clipboard=bool(self.config.get("restore_clipboard_after_paste", True)),
-                    target=self._focus_target,
-                ):
-                    log_routing("route: focused_target_pasted success")
-                    return "focused_target_pasted"
-                if self._hotkey_direct_type_allowed(text):
-                    activate_window_by_pid(self._focus_target.source_pid)
-                    if type_text_via_ydotool(text):
-                        log_routing("route: ydotool_typed success after focused-target paste failure")
-                        return "ydotool_typed"
-                log_routing("route: focused target delivery failed")
-
-        # Strict focus lock: never inject into a different focused app when a lock target exists.
-        lock_is_usable = has_focus_target_identity(self._focus_target_at_start)
-        if self._capture_focus and lock_is_usable:
-            current_focus = capture_focus_target_for_hotkey(retries=4, delay_s=0.03)
-            if not same_focus_target(current_focus, self._focus_target_at_start):
-                log_routing(
-                    "route: focus changed, attempting restore to original target "
-                    f"(start={focus_signature(self._focus_target_at_start)}, current={focus_signature(current_focus)})"
-                )
-                # Try to force-focus the original captured target and deliver there.
-                locked_target = self._focus_target
-                if locked_target is None and self._focus_target_at_start is not None:
-                    locked_target = resolve_focus_target_from_hint(self._focus_target_at_start)
-                    if locked_target is not None:
-                        self._focus_target = locked_target
-                        log_routing(
-                            "route: restored locked target from saved hint "
-                            f"app={locked_target.source_app!r} pid={locked_target.source_pid}"
-                        )
-                if (
-                    locked_target is not None
-                    and locked_target.source_pid != os.getpid()
-                ):
-                    # Activate at compositor level, then AT-SPI level.
-                    activate_window_by_pid(locked_target.source_pid)
-                    time.sleep(0.10)
-                    focus_target_element(locked_target)
-                    time.sleep(0.05)
-                    if insert_text_into_target(locked_target, text):
-                        self._last_route_note = "Focus changed, but text was delivered to the original target."
-                        log_routing("route: focused_target success after forced refocus")
-                        return "focused_target"
-                    # Re-activate at compositor level before paste.
-                    activate_window_by_pid(locked_target.source_pid)
-                    time.sleep(0.10)
-                    focus_target_element(locked_target)
-                    if paste_text_via_clipboard(
-                        text,
-                        restore_clipboard=bool(self.config.get("restore_clipboard_after_paste", True)),
-                        target=locked_target,
-                    ):
-                        self._last_route_note = "Focus changed, but pasted to the original target after refocus."
-                        log_routing("route: focused_target_pasted success after forced refocus")
-                        return "focused_target_pasted"
-                    if self._hotkey_direct_type_allowed(text) and type_text_via_ydotool(text):
-                        self._last_route_note = "Focus changed, but typed into the original target after refocus."
-                        log_routing("route: ydotool_typed success after forced refocus")
-                        return "ydotool_typed"
-
-                if copy_to_clipboard(text):
-                    self._last_route_note = (
-                        "Focus changed during transcription and original target could not be restored."
-                    )
-                    return "clipboard_only"
-                self._last_route_note = "Focus changed and clipboard copy failed."
-                return "gui_only"
-        elif self._capture_focus:
-            if copy_to_clipboard(text):
-                self._last_route_note = "No reliable start text box was captured; transcript copied to clipboard."
-                log_routing("route: clipboard_only (no usable start-focus lock)")
-                return "clipboard_only"
-            self._last_route_note = "No reliable start text box was captured and clipboard copy failed."
-            return "gui_only"
-
-        current_focus: FocusTarget | None = None
-        if self._capture_focus:
-            current_focus = capture_focus_target_for_hotkey(retries=2, delay_s=0.02)
-            self._remember_focus_target(current_focus)
-            if (
-                current_focus is not None
-                and current_focus.source_pid != os.getpid()
-                and insert_text_into_target(current_focus, text)
-            ):
-                log_routing("route: focused_current_target success (best-effort)")
-                return "focused_current_target"
-
-        if bool(self.config.get("paste_fallback_for_hotkey", True)):
-            if current_focus is None:
-                current_focus = capture_focus_target_for_hotkey(retries=2, delay_s=0.02)
-                self._remember_focus_target(current_focus)
-            paste_target = current_focus or self._recent_focus_target(max_age_seconds=1.0)
-            if current_focus is not None and current_focus.source_pid == os.getpid():
-                # Never paste into our own window; keep clipboard fallback instead.
-                if copy_to_clipboard(text):
-                    self._last_route_note = "Focused app switched to Voice Typing; paste was skipped for safety."
-                    log_routing("route: clipboard_only (focus switched to Voice Typing)")
-                    return "clipboard_only"
-                return "gui_only"
-
-            # Prefer paste path first because it is typically instant.
+        if same_window and start is not None:
             if paste_text_via_clipboard(
                 text,
-                restore_clipboard=bool(self.config.get("restore_clipboard_after_paste", True)),
-                target=paste_target,
+                restore_clipboard=restore_clipboard,
+                target=current,
+                shortcut=self._paste_shortcut_for(current),
             ):
-                log_routing("route: clipboard+pasted success")
-                return "clipboard+pasted"
+                self._clipboard_text = text
+                log_routing("route: focused_target_pasted success")
+                return "focused_target_pasted"
+            if start.accessible is not None and insert_text_into_target(start, text):
+                log_routing("route: focused_target success after paste failure")
+                return "focused_target"
+            if self._hotkey_direct_type_allowed(text) and type_text_via_ydotool(text):
+                log_routing("route: ydotool_typed success after paste failure")
+                return "ydotool_typed"
+            return self._copy_transcript_only(text, "Could not send the paste shortcut; transcript copied to clipboard.")
 
-            if self._hotkey_direct_type_allowed(text):
-                if type_text_via_ydotool(text):
+        if same_window is False and start is not None:
+            # Never paste into the window the user moved to. An editable
+            # AT-SPI field can still take the text without having focus.
+            if start.accessible is not None and insert_text_into_target(start, text):
+                self._add_route_note("Focus moved, but text was inserted into the original field.")
+                log_routing("route: focused_target success after focus moved")
+                return "focused_target"
+            moved_to = current.source_app if current is not None else "another window"
+            return self._copy_transcript_only(
+                text,
+                f"Focus moved from {start.source_app} to {moved_to}; transcript copied to clipboard.",
+            )
+
+        # Recording started with no accessible window focused.
+        if current is None:
+            # Nothing visible changed either (e.g. an app without AT-SPI);
+            # paste best-effort.
+            if bool(self.config.get("paste_fallback_for_hotkey", True)):
+                if paste_text_via_clipboard(text, restore_clipboard=restore_clipboard, target=None):
+                    self._clipboard_text = text
+                    log_routing("route: clipboard+pasted success (focused window not exposed to AT-SPI)")
+                    return "clipboard+pasted"
+                if self._hotkey_direct_type_allowed(text) and type_text_via_ydotool(text):
                     log_routing("route: ydotool_typed success")
                     return "ydotool_typed"
-                log_routing("route: ydotool_typed failed")
+                return self._copy_transcript_only(text, "Could not send the paste shortcut; text was copied only.")
+            return self._copy_transcript_only(text, "", route="clipboard")
 
-            self._last_route_note = "Could not send Ctrl+V via ydotool; text was copied only."
-            log_routing("route: clipboard paste fallback failed")
+        if bool(self.config.get("auto_paste_current_focus", False)) and paste_text_via_clipboard(
+            text,
+            restore_clipboard=restore_clipboard,
+            target=current,
+            shortcut=self._paste_shortcut_for(current),
+        ):
+            self._clipboard_text = text
+            log_routing("route: clipboard+pasted success (auto_paste_current_focus)")
+            return "clipboard+pasted"
+        if bool(self.config.get("ask_when_focus_uncertain", False)):
+            speak_prompt(
+                "I could not identify the target window. Focus the window and say voice typing paste last.",
+                bool(self.config.get("voice_prompts_enabled", False)),
+            )
+        return self._copy_transcript_only(
+            text,
+            "No text box was focused when recording started; transcript copied to clipboard.",
+        )
 
+    def _delivery_focus_target(self) -> FocusTarget | None:
+        # Retry briefly so a transient AT-SPI miss is not mistaken for the
+        # user leaving the window.
+        for attempt in range(3):
+            target = capture_focus_target()
+            if target is not None:
+                return target
+            if attempt < 2:
+                time.sleep(0.05)
+        return None
+
+    def _paste_shortcut_for(self, target: FocusTarget | None) -> str | None:
+        overrides = self.config.get("paste_shortcut_overrides", {})
+        if target is None or not isinstance(overrides, dict):
+            return None
+        app = (target.source_app or "").strip().lower()
+        for name, shortcut in overrides.items():
+            if str(name).strip().lower() != app:
+                continue
+            value = str(shortcut).strip().lower().replace(" ", "")
+            if value in PASTE_SHORTCUT_KEYS:
+                return value
+            log_routing(f"route: ignored unknown paste shortcut {shortcut!r} for app {name!r}")
+        return None
+
+    def _add_route_note(self, note: str) -> None:
+        if not note:
+            return
+        self._last_route_note = f"{self._last_route_note} {note}" if self._last_route_note else note
+
+    def _copy_transcript_only(self, text: str, note: str, route: str = "clipboard_only") -> str:
         if copy_to_clipboard(text):
-            if bool(self.config.get("auto_paste_current_focus", False)) and paste_current_focus_via_ydotool(
-                target=capture_focus_target() or self._recent_focus_target(max_age_seconds=1.0)
-            ):
-                log_routing("route: clipboard+pasted success (auto_paste_current_focus)")
-                return "clipboard+pasted"
-            if bool(self.config.get("auto_paste_current_focus", False)):
-                self._last_route_note = "Auto-paste requested but ydotool paste failed."
-                return "clipboard_only"
-            return "clipboard"
-
-        self._last_route_note = "Clipboard write failed."
+            self._clipboard_text = text
+            self._add_route_note(note)
+            log_routing(f"route: {route} {note!r}")
+            return route
+        self._add_route_note("Clipboard copy failed.")
         log_routing("route: gui_only (clipboard unavailable)")
         return "gui_only"
 
@@ -3690,6 +3812,7 @@ class IpcServer(threading.Thread):
         self.config = config
         self.on_show = on_show
         self._stop_event = threading.Event()
+        self._bound_inode: int | None = None
         self._socket: socket.socket | None = None
         self._last_toggle_at = 0.0
 
@@ -3700,8 +3823,11 @@ class IpcServer(threading.Thread):
                 self._socket.close()
             except Exception:
                 pass
+        # Only remove the socket file this server created: another instance
+        # may have bound the path since, and deleting it would cut that
+        # instance off from every hotkey.
         try:
-            if os.path.exists(SOCKET_PATH):
+            if self._bound_inode is not None and os.stat(SOCKET_PATH).st_ino == self._bound_inode:
                 os.unlink(SOCKET_PATH)
         except Exception:
             pass
@@ -3714,6 +3840,7 @@ class IpcServer(threading.Thread):
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             server.bind(SOCKET_PATH)
             os.chmod(SOCKET_PATH, 0o600)
+            self._bound_inode = os.stat(SOCKET_PATH).st_ino
             server.listen(10)
             server.settimeout(0.4)
             self._socket = server
@@ -3753,7 +3880,7 @@ class IpcServer(threading.Thread):
         def ensure_focus_hint() -> dict[str, Any] | None:
             if focus_hint is not None:
                 return focus_hint
-            cached = self.controller.recent_focus_hint(max_age_seconds=0.75)
+            cached = self.controller.current_focus_hint()
             if cached is not None:
                 log_routing(
                     "ipc: using cached focus hint "
@@ -3901,835 +4028,6 @@ class IpcServer(threading.Thread):
             return {"ok": True, "message": f"Ollama model set to {model}"}
 
         return {"ok": False, "error": f"unknown command: {cmd}"}
-
-
-class VoiceTypingGui:
-    def __init__(
-        self,
-        toggle_on_launch: bool,
-        startup_focus_target: FocusTarget | None = None,
-        startup_focus_hint: dict[str, Any] | None = None,
-    ) -> None:
-        self.config = ConfigManager(CONFIG_PATH)
-        self.events: "queue.Queue[tuple[str, Any, Any]]" = queue.Queue()
-        self.startup_focus_target = startup_focus_target
-        self.startup_focus_hint = startup_focus_hint
-
-        self.root = tk.Tk()
-        self.root.title(APP_NAME)
-        self.root.geometry("560x420")
-        self.root.minsize(440, 320)
-        self.root.configure(bg="#0f1115")
-        self.root.withdraw()
-        self.root.resizable(True, True)
-        # Prevent the window manager from stealing compositor focus when this
-        # window is shown.  "utility" type tells the WM this is a secondary
-        # helper window; "passive" focus model prevents automatic focus grabs.
-        try:
-            self.root.attributes("-type", "utility")
-        except Exception:
-            pass
-        self.root.wm_focusmodel("passive")
-        self._configure_style()
-        self._apply_window_presentation()
-
-        self.status_var = tk.StringVar(value="Idle")
-        self.elapsed_var = tk.StringVar(value="00:00")
-        self.route_var = tk.StringVar(value="Target: none yet")
-        self.engine_var = tk.StringVar(value=self.config.transcription_engine())
-        self.language_var = tk.StringVar(value=str(self.config.get("language", "auto")))
-        self.model_var = tk.StringVar(value=str(self.config.get("model", "")))
-        self.gemma_model_var = tk.StringVar(value=self.config.gemma_model_ref())
-        self.ollama_model_var = tk.StringVar(value=self.config.ollama_model())
-        configured_context = str(self.config.get("ollama_context_tokens", 2048)).strip()
-        self.ollama_context_var = tk.StringVar(
-            value=configured_context
-            if configured_context in {"1024", "2048", "4096", "8192", "16384"}
-            else "2048"
-        )
-        self.dictation_translation_target_var = tk.StringVar(
-            value=str(self.config.get("dictation_translation_target_language", "English"))
-        )
-        self.dictation_translation_var = tk.BooleanVar(
-            value=bool(self.config.get("dictation_translation_enabled", False))
-        )
-        self.dictation_translation_speak_var = tk.BooleanVar(
-            value=bool(self.config.get("dictation_translation_speak_aloud", False))
-        )
-
-        self.controller = RecorderController(
-            config=self.config,
-            on_state_change=lambda recording, reason: self.events.put(("state", recording, reason)),
-            on_transcript=lambda text, route: self.events.put(("transcript", text, route)),
-            on_audio_quality=lambda verdict, message: self.events.put(("audio_quality", verdict, message)),
-        )
-        self.ipc = IpcServer(
-            self.controller,
-            self.config,
-            on_show=lambda active: self.events.put(("show", None, active)),
-        )
-
-        self._build_ui()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        self.ipc.start()
-        self._tick()
-
-        if toggle_on_launch:
-            # Starting from a keyboard shortcut should capture target focus.
-            self.controller.start_recording_with_target(
-                capture_focus=True,
-                started_from_gui=False,
-                focus_target=self.startup_focus_target,
-                focus_target_at_start_hint=focus_target_from_hint(self.startup_focus_hint),
-            )
-            if bool(self.config.get("show_panel_on_hotkey_start", True)):
-                self._show_window(active=False)
-        else:
-            self._show_window(active=True)
-
-    def _apply_window_presentation(self) -> None:
-        try:
-            controller = getattr(self, "controller", None)
-            # Recording must not turn the helper into a focus-stealing
-            # always-on-top window. The original target is tracked separately.
-            keep_on_top = bool(self.config.get("window_always_on_top", False))
-            self.root.attributes("-topmost", keep_on_top)
-        except Exception:
-            pass
-        try:
-            opacity = float(self.config.get("window_opacity", 0.95))
-            opacity = max(0.35, min(1.0, opacity))
-            self.root.attributes("-alpha", opacity)
-        except Exception:
-            pass
-
-    def _configure_style(self) -> None:
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure(".", font=("DejaVu Sans Mono", 10))
-        style.configure("VT.Root.TFrame", background="#0f1115")
-        style.configure("VT.Card.TFrame", background="#171a20")
-        style.configure("VT.Status.TLabel", font=("DejaVu Sans Mono", 11, "bold"), foreground="#f1f5f9", background="#171a20")
-        style.configure("VT.Meta.TLabel", foreground="#f59e0b", background="#0f1115")
-        style.configure("VT.TButton", padding=(10, 4), background="#ea580c", foreground="#fff7ed", borderwidth=0)
-        style.map(
-            "VT.TButton",
-            background=[("pressed", "#c2410c"), ("active", "#fb923c")],
-            foreground=[("disabled", "#fed7aa"), ("!disabled", "#fff7ed")],
-        )
-        style.configure(
-            "VT.Detail.TButton",
-            padding=(8, 3),
-            background="#2b313b",
-            foreground="#e2e8f0",
-            borderwidth=0,
-        )
-        style.map(
-            "VT.Detail.TButton",
-            background=[("pressed", "#1f242c"), ("active", "#3d4653")],
-            foreground=[("disabled", "#94a3b8"), ("!disabled", "#e2e8f0")],
-        )
-        style.configure("VT.TCheckbutton", background="#171a20", foreground="#cbd5e1")
-
-    def _build_ui(self) -> None:
-        root_pad = ttk.Frame(self.root, padding=10, style="VT.Root.TFrame")
-        root_pad.pack(fill="both", expand=True)
-
-        # Plain tk widgets here so the whole bar can change color with state.
-        self.status_bar = tk.Frame(root_pad, bg="#171a20", padx=10, pady=8)
-        self.status_bar.pack(fill="x")
-
-        self.dot = tk.Canvas(self.status_bar, width=18, height=18, highlightthickness=0, bd=0, bg="#171a20")
-        self.dot.pack(side="left", padx=(0, 8))
-        self.dot_indicator = self.dot.create_oval(2, 2, 16, 16, fill="#475569", outline="")
-
-        self.status_label = tk.Label(
-            self.status_bar,
-            textvariable=self.status_var,
-            font=("DejaVu Sans Mono", 13, "bold"),
-            fg="#94a3b8",
-            bg="#171a20",
-        )
-        self.status_label.pack(side="left")
-        self.elapsed_label = tk.Label(
-            self.status_bar,
-            textvariable=self.elapsed_var,
-            font=("DejaVu Sans Mono", 12),
-            fg="#94a3b8",
-            bg="#171a20",
-        )
-        self.elapsed_label.pack(side="left", padx=(10, 0))
-
-        self.toggle_btn = ttk.Button(self.status_bar, text="Record", style="VT.TButton", command=self._toggle_from_gui)
-        self.toggle_btn.pack(side="right")
-        self.translate_btn = ttk.Button(
-            self.status_bar,
-            text="Translate take",
-            style="VT.Detail.TButton",
-            command=self._translate_from_gui,
-        )
-        self.translate_btn.pack(side="right", padx=(0, 6))
-        ttk.Label(self.status_bar, text="to", style="VT.Meta.TLabel").pack(side="right", padx=(8, 4))
-        self.translate_target_combo = ttk.Combobox(
-            self.status_bar,
-            textvariable=self.dictation_translation_target_var,
-            values=["English", "Hebrew", "French", "Italian"],
-            state="readonly",
-            width=9,
-        )
-        self.translate_target_combo.pack(side="right")
-        self.translate_target_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_options())
-        ttk.Checkbutton(
-            self.status_bar,
-            text="Translate",
-            variable=self.dictation_translation_var,
-            command=self._save_options,
-            style="VT.TCheckbutton",
-        ).pack(side="right", padx=(8, 0))
-        ttk.Checkbutton(
-            self.status_bar,
-            text="Speak",
-            variable=self.dictation_translation_speak_var,
-            command=self._save_options,
-            style="VT.TCheckbutton",
-        ).pack(side="right", padx=(8, 0))
-        ttk.Button(self.status_bar, text="Settings", style="VT.TButton", command=self._toggle_settings).pack(
-            side="right", padx=(0, 6)
-        )
-        ttk.Button(self.status_bar, text="Stop", style="VT.TButton", command=self._stop_from_gui).pack(
-            side="right", padx=(0, 6)
-        )
-
-        mode_row = ttk.Frame(root_pad, style="VT.Root.TFrame")
-        mode_row.pack(fill="x", pady=(6, 0))
-        ttk.Label(mode_row, text="Mode:", style="VT.Meta.TLabel").pack(side="left")
-        self.stable_mode_btn = tk.Button(
-            mode_row,
-            text="Stable · Whisper",
-            relief="flat",
-            bd=0,
-            padx=10,
-            pady=3,
-            font=("DejaVu Sans Mono", 10, "bold"),
-            command=lambda: self._apply_profile("stable"),
-        )
-        self.stable_mode_btn.pack(side="left", padx=(8, 4))
-        self.gemma_mode_btn = tk.Button(
-            mode_row,
-            text="Gemma Agent · Ollama",
-            relief="flat",
-            bd=0,
-            padx=10,
-            pady=3,
-            font=("DejaVu Sans Mono", 10, "bold"),
-            command=lambda: self._apply_profile("gemma-agent"),
-        )
-        self.gemma_mode_btn.pack(side="left", padx=(0, 4))
-        self.ask_mode_btn = tk.Button(
-            mode_row,
-            text="Ask Gemma",
-            relief="flat",
-            bd=0,
-            padx=10,
-            pady=3,
-            font=("DejaVu Sans Mono", 10, "bold"),
-            command=lambda: self._apply_profile("ask-gemma"),
-        )
-        self.ask_mode_btn.pack(side="left", padx=(0, 4))
-        self._update_mode_buttons()
-
-        ttk.Label(root_pad, textvariable=self.route_var, style="VT.Meta.TLabel").pack(
-            anchor="w", pady=(4, 0)
-        )
-
-        self.mic_quality_var = tk.StringVar(value="")
-        self.mic_quality_label = tk.Label(
-            root_pad,
-            textvariable=self.mic_quality_var,
-            font=("DejaVu Sans Mono", 9),
-            fg="#64748b",
-            bg="#0f1115",
-            anchor="w",
-        )
-        self.mic_quality_label.pack(fill="x", pady=(2, 0))
-
-        transcript_frame = ttk.Frame(root_pad, style="VT.Card.TFrame", padding=(8, 8))
-        transcript_frame.pack(fill="both", expand=True, pady=(8, 6))
-        ttk.Label(transcript_frame, text="Latest Transcript", style="VT.Meta.TLabel").pack(anchor="w")
-        self.transcript_box = tk.Text(
-            transcript_frame,
-            wrap="word",
-            height=2,
-            bg="#0b0d10",
-            fg="#f8fafc",
-            insertbackground="#f8fafc",
-            highlightthickness=1,
-            highlightbackground="#334155",
-            relief="solid",
-            bd=1,
-        )
-        self.transcript_box.pack(fill="both", expand=True, pady=(4, 0))
-        self.transcript_box.configure(state="disabled")
-
-        self.options_visible = False
-        self.options_frame = ttk.Frame(root_pad, style="VT.Card.TFrame", padding=(8, 8))
-        options_frame = self.options_frame
-        options_frame.pack(fill="x")
-
-        engine_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
-        engine_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(engine_row, text="Engine:", style="VT.Meta.TLabel").pack(side="left")
-        self.engine_combo = ttk.Combobox(
-            engine_row,
-            textvariable=self.engine_var,
-            state="readonly",
-            values=list(SUPPORTED_TRANSCRIPTION_ENGINES),
-            width=10,
-        )
-        self.engine_combo.pack(side="left", padx=(6, 8))
-        self.engine_combo.bind("<<ComboboxSelected>>", self._on_engine_selected)
-
-        model_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
-        model_row.pack(fill="x", pady=(4, 4))
-        ttk.Label(model_row, text="Whisper:", style="VT.Meta.TLabel").pack(side="left")
-        self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var, state="readonly")
-        self.model_combo.pack(side="left", fill="x", expand=True, padx=(6, 6))
-        self.model_combo.bind("<<ComboboxSelected>>", self._on_model_selected)
-        ttk.Button(model_row, text="Refresh", style="VT.Detail.TButton", command=self._refresh_models).pack(
-            side="left"
-        )
-
-        language_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
-        language_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(language_row, text="Speech language:", style="VT.Meta.TLabel").pack(side="left")
-        language_combo = ttk.Combobox(
-            language_row,
-            textvariable=self.language_var,
-            values=["auto", "en", "he", "fr", "it"],
-            width=10,
-        )
-        language_combo.pack(side="left", padx=(6, 0))
-        language_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_options())
-        ttk.Label(
-            language_row,
-            text="auto preserves the language/script; use a multilingual Whisper model",
-            style="VT.Meta.TLabel",
-        ).pack(side="left", padx=(8, 0))
-
-        gemma_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
-        gemma_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(gemma_row, text="Gemma:", style="VT.Meta.TLabel").pack(side="left")
-        self.gemma_model_entry = ttk.Entry(gemma_row, textvariable=self.gemma_model_var)
-        self.gemma_model_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
-        ttk.Button(gemma_row, text="Apply", style="VT.Detail.TButton", command=self._on_gemma_model_applied).pack(
-            side="left"
-        )
-
-        ollama_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
-        ollama_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(ollama_row, text="Ollama:", style="VT.Meta.TLabel").pack(side="left")
-        self.ollama_combo = ttk.Combobox(ollama_row, textvariable=self.ollama_model_var)
-        self.ollama_combo.pack(side="left", fill="x", expand=True, padx=(6, 6))
-        self.ollama_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_ollama_model_applied())
-        ttk.Button(
-            ollama_row, text="Refresh", style="VT.Detail.TButton", command=self._refresh_ollama_models
-        ).pack(side="left", padx=(0, 6))
-        ttk.Button(ollama_row, text="Apply", style="VT.Detail.TButton", command=self._on_ollama_model_applied).pack(
-            side="left"
-        )
-
-        context_row = ttk.Frame(options_frame, style="VT.Card.TFrame")
-        context_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(context_row, text="Ollama context tokens:", style="VT.Meta.TLabel").pack(side="left")
-        context_combo = ttk.Combobox(
-            context_row,
-            textvariable=self.ollama_context_var,
-            values=["1024", "2048", "4096", "8192", "16384"],
-            state="readonly",
-            width=8,
-        )
-        context_combo.pack(side="left", padx=(6, 8))
-        context_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_options())
-        ttk.Label(
-            context_row,
-            text="lower values use less VRAM; 2048 is a good RTX 8 GB starting point",
-            style="VT.Meta.TLabel",
-        ).pack(side="left")
-
-        self.auto_paste_var = tk.BooleanVar(value=bool(self.config.get("auto_paste_current_focus", False)))
-        self.gui_clipboard_var = tk.BooleanVar(
-            value=bool(self.config.get("copy_to_clipboard_when_started_from_gui", False))
-        )
-        self.always_on_top_var = tk.BooleanVar(value=bool(self.config.get("window_always_on_top", False)))
-        self.show_on_hotkey_var = tk.BooleanVar(value=bool(self.config.get("show_panel_on_hotkey_start", True)))
-        self.use_gpu_var = tk.BooleanVar(value=not bool(self.config.get("no_gpu", True)))
-        self.streaming_var = tk.BooleanVar(value=bool(self.config.get("streaming_transcription", False)))
-        self.voice_commands_var = tk.BooleanVar(value=bool(self.config.get("voice_commands_enabled", True)))
-        self.speak_answers_var = tk.BooleanVar(value=bool(self.config.get("answer_speak_aloud", True)))
-        self.always_copy_hotkey_var = tk.BooleanVar(
-            value=bool(self.config.get("always_copy_hotkey_to_clipboard", True))
-        )
-
-        ttk.Checkbutton(
-            options_frame,
-            text="Auto-paste when fallback uses clipboard",
-            variable=self.auto_paste_var,
-            command=self._save_options,
-            style="VT.TCheckbutton",
-        ).pack(anchor="w")
-
-        ttk.Checkbutton(
-            options_frame,
-            text="GUI-start recordings also copy to clipboard",
-            variable=self.gui_clipboard_var,
-            command=self._save_options,
-            style="VT.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-
-        ttk.Checkbutton(
-            options_frame,
-            text="Always copy hotkey results to clipboard",
-            variable=self.always_copy_hotkey_var,
-            command=self._save_options,
-            style="VT.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-
-        ttk.Checkbutton(
-            options_frame,
-            text="Keep panel always on top",
-            variable=self.always_on_top_var,
-            command=self._save_options,
-            style="VT.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-
-        ttk.Checkbutton(
-            options_frame,
-            text="Show panel on hotkey start (no focus)",
-            variable=self.show_on_hotkey_var,
-            command=self._save_options,
-            style="VT.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-
-        ttk.Checkbutton(
-            options_frame,
-            text="Use GPU for transcription (if available)",
-            variable=self.use_gpu_var,
-            command=self._save_options,
-            style="VT.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-
-        ttk.Checkbutton(
-            options_frame,
-            text="Rolling chunks while recording",
-            variable=self.streaming_var,
-            command=self._save_options,
-            style="VT.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-
-        ttk.Checkbutton(
-            options_frame,
-            text="Voice commands",
-            variable=self.voice_commands_var,
-            command=self._save_options,
-            style="VT.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-
-        ttk.Checkbutton(
-            options_frame,
-            text="Speak answers aloud (Ask Gemma mode)",
-            variable=self.speak_answers_var,
-            command=self._save_options,
-            style="VT.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-
-        bottom = ttk.Frame(options_frame, style="VT.Card.TFrame")
-        bottom.pack(fill="x")
-        ttk.Button(bottom, text="Copy Last", style="VT.Detail.TButton", command=self._copy_last_transcript).pack(
-            side="left"
-        )
-        ttk.Button(bottom, text="Stop", style="VT.Detail.TButton", command=self._stop_from_gui).pack(
-            side="left",
-            padx=(6, 0),
-        )
-        ttk.Button(
-            bottom, text="Retry Last Audio", style="VT.Detail.TButton", command=self._retry_last_audio
-        ).pack(side="left", padx=(6, 0))
-        ttk.Button(bottom, text="Model Help", style="VT.Detail.TButton", command=self._show_model_help).pack(
-            side="right"
-        )
-        self.options_frame.pack_forget()
-
-        self._refresh_models()
-        self._refresh_ollama_models()
-
-    def _toggle_settings(self) -> None:
-        self.options_visible = not self.options_visible
-        if self.options_visible:
-            self.options_frame.pack(fill="x")
-        else:
-            self.options_frame.pack_forget()
-
-    def _refresh_ollama_models(self) -> None:
-        def _fetch() -> None:
-            names = list_ollama_models(self.config.ollama_url())
-            if names:
-                self.events.put(("ollama_models", names, None))
-
-        threading.Thread(target=_fetch, daemon=True).start()
-
-    def _apply_profile(self, profile: str) -> None:
-        updates = PROFILE_CONFIGS.get(profile)
-        if not updates:
-            return
-        if self.controller.is_recording() or self.controller.is_transcribing():
-            notify("Voice typing", "Stop recording before switching mode")
-            return
-        for key, value in updates.items():
-            self.config.set(key, value)
-        self.config.set("active_profile", profile)
-        self.engine_var.set(self.config.transcription_engine())
-        self.streaming_var.set(bool(self.config.get("streaming_transcription", False)))
-        self.voice_commands_var.set(bool(self.config.get("voice_commands_enabled", True)))
-        self._update_mode_buttons()
-        if profile in ("gemma-agent", "ask-gemma"):
-            # Start loading the model now instead of on first use.
-            self.controller.warm_up_transcriber_async()
-        self.route_var.set(f"Mode switched to {profile}.")
-        notify("Voice typing", f"Mode: {profile}")
-
-    def _update_mode_buttons(self) -> None:
-        engine = self.config.transcription_engine()
-        answer_mode = bool(self.config.get("assistant_answer_mode", False))
-        active = {"bg": "#ea580c", "fg": "#fff7ed", "activebackground": "#fb923c", "activeforeground": "#fff7ed"}
-        inactive = {"bg": "#2b313b", "fg": "#94a3b8", "activebackground": "#3d4653", "activeforeground": "#e2e8f0"}
-        self.stable_mode_btn.configure(**(active if engine == "whisper" and not answer_mode else inactive))
-        self.gemma_mode_btn.configure(**(active if engine == "ollama" and not answer_mode else inactive))
-        self.ask_mode_btn.configure(**(active if answer_mode else inactive))
-
-    def _set_visual_state(self, state: str) -> None:
-        palettes = {
-            "idle": {"bar": "#171a20", "fg": "#94a3b8", "dot": "#475569", "title": APP_NAME},
-            "recording": {"bar": "#7f1d1d", "fg": "#fee2e2", "dot": "#f87171", "title": f"● RECORDING — {APP_NAME}"},
-            "transcribing": {"bar": "#78350f", "fg": "#ffedd5", "dot": "#fbbf24", "title": f"… Transcribing — {APP_NAME}"},
-        }
-        palette = palettes.get(state, palettes["idle"])
-        self._visual_state = state
-        self.status_bar.configure(bg=palette["bar"])
-        self.dot.configure(bg=palette["bar"])
-        self.dot.itemconfig(self.dot_indicator, fill=palette["dot"])
-        self.status_label.configure(bg=palette["bar"], fg=palette["fg"])
-        self.elapsed_label.configure(bg=palette["bar"], fg=palette["fg"])
-        try:
-            self.root.title(palette["title"])
-        except Exception:
-            pass
-
-    def _refresh_models(self) -> None:
-        models = self.config.list_models()
-        self.model_combo["values"] = models
-
-        current = str(self.config.get("model", "")).strip()
-        if current in models:
-            self.model_var.set(current)
-        elif models:
-            self.model_var.set(models[0])
-            self.config.set("model", models[0])
-        else:
-            self.model_var.set("")
-
-    def _on_model_selected(self, _event: Any) -> None:
-        model = self.model_var.get().strip()
-        if not model:
-            return
-        self.config.set("model", model)
-
-    def _on_engine_selected(self, _event: Any) -> None:
-        engine = self.engine_var.get().strip().lower()
-        engine = ENGINE_ALIASES.get(engine, engine)
-        if engine not in SUPPORTED_TRANSCRIPTION_ENGINES:
-            return
-        self.config.set("transcription_engine", engine)
-        self._update_mode_buttons()
-        if engine == "ollama":
-            self.controller.warm_up_transcriber_async()
-
-    def _on_gemma_model_applied(self) -> None:
-        model_ref = self.gemma_model_var.get().strip()
-        if not model_ref:
-            return
-        if model_ref.startswith("/") or model_ref.startswith("~"):
-            self.config.set("gemma_model_path", model_ref)
-        else:
-            self.config.set("gemma_model", model_ref)
-            self.config.set("gemma_model_path", "")
-        notify("Voice typing", f"Gemma model set to {model_ref}")
-
-    def _on_ollama_model_applied(self) -> None:
-        model_ref = self.ollama_model_var.get().strip()
-        if not model_ref:
-            return
-        self.config.set("ollama_model", model_ref)
-        notify("Voice typing", f"Ollama model set to {model_ref}")
-
-    def _save_options(self) -> None:
-        self.config.set("language", self.language_var.get().strip() or "auto")
-        self.config.set("auto_paste_current_focus", bool(self.auto_paste_var.get()))
-        self.config.set(
-            "copy_to_clipboard_when_started_from_gui",
-            bool(self.gui_clipboard_var.get()),
-        )
-        self.config.set("window_always_on_top", bool(self.always_on_top_var.get()))
-        self.config.set("show_panel_on_hotkey_start", bool(self.show_on_hotkey_var.get()))
-        self.config.set("no_gpu", not bool(self.use_gpu_var.get()))
-        try:
-            context_tokens = max(512, min(262144, int(self.ollama_context_var.get().strip())))
-        except (TypeError, ValueError):
-            context_tokens = 2048
-        self.config.set("ollama_context_tokens", context_tokens)
-        self.config.set("streaming_transcription", bool(self.streaming_var.get()))
-        self.config.set("voice_commands_enabled", bool(self.voice_commands_var.get()))
-        self.config.set("answer_speak_aloud", bool(self.speak_answers_var.get()))
-        self.config.set("always_copy_hotkey_to_clipboard", bool(self.always_copy_hotkey_var.get()))
-        self.config.set("dictation_translation_enabled", bool(self.dictation_translation_var.get()))
-        self.config.set(
-            "dictation_translation_target_language",
-            self.dictation_translation_target_var.get().strip() or "English",
-        )
-        self.config.set(
-            "dictation_translation_speak_aloud",
-            bool(self.dictation_translation_speak_var.get()),
-        )
-        self._apply_window_presentation()
-
-    def _toggle_from_gui(self) -> None:
-        ok, message = self.controller.toggle_recording(capture_focus=False, started_from_gui=True)
-        if not ok:
-            self.status_var.set(message)
-            notify("Voice typing", message, urgency="critical")
-
-    def _translate_from_gui(self) -> None:
-        """Start a one-shot Whisper -> Gemma translation take."""
-        if self.controller.is_recording():
-            ok, message = self.controller.stop_recording_async(reason="manual_stop")
-        else:
-            self._save_options()
-            ok, message = self.controller.start_translation_recording(
-                capture_focus=True,
-                started_from_gui=False,
-            )
-            if ok:
-                self.controller.restore_original_focus_target(max_age_seconds=10.0)
-        self.status_var.set(message)
-        if not ok:
-            notify("Voice typing", message, urgency="critical")
-
-    def _stop_from_gui(self) -> None:
-        self.controller.speaker.stop()
-        ok, message = self.controller.stop_recording_async(reason="manual_stop")
-        if not ok:
-            self.status_var.set(message)
-
-    def _retry_last_audio(self) -> None:
-        ok, message = self.controller.retranscribe_path_async()
-        self.route_var.set(message)
-        if not ok:
-            notify("Voice typing", message, urgency="critical")
-
-    def _copy_last_transcript(self) -> None:
-        self.transcript_box.configure(state="normal")
-        text = self.transcript_box.get("1.0", "end").strip()
-        self.transcript_box.configure(state="disabled")
-        if not text:
-            return
-        if copy_to_clipboard(text):
-            notify("Voice typing", "Last transcript copied to clipboard")
-
-    def _show_model_help(self) -> None:
-        models_dir = self.config.models_dir()
-        whisper_dir = self.config.whisper_cli_path().parent.parent.parent
-        msg = (
-            "Whisper models:\n\n"
-            f"cd {whisper_dir}\n"
-            "./models/download-ggml-model.sh small.en\n"
-            "./models/download-ggml-model.sh base.en\n\n"
-            f"Then click Refresh.\nCurrent models directory: {models_dir}\n\n"
-            "Gemma 4 through Transformers is optional. Set Engine = gemma4-transformers and use either "
-            "google/gemma-4-E4B-it or a local model directory. Gemma audio clips are "
-            "processed as rolling chunks of 30 seconds or less.\n\n"
-            "For the existing local Gemma model, set Engine = ollama and Ollama = gemma4:latest."
-        )
-        messagebox.showinfo("Model Help", msg)
-
-    def _tick(self) -> None:
-        self._drain_events()
-        self._update_elapsed()
-        self.root.after(200, self._tick)
-
-    def _drain_events(self) -> None:
-        while True:
-            try:
-                event, data, meta = self.events.get_nowait()
-            except queue.Empty:
-                return
-
-            if event == "state":
-                recording = bool(data)
-                reason = str(meta)
-                if recording:
-                    self.status_var.set("● RECORDING")
-                    self._set_visual_state("recording")
-                    self.toggle_btn.configure(text="Stop")
-                    if reason == "warning":
-                        self.status_var.set("● RECORDING (near limit)")
-                else:
-                    self.status_var.set("Idle")
-                    self._set_visual_state("idle")
-                    self.toggle_btn.configure(text="Record")
-                    if reason in {"limit_or_error", "limit_reached"}:
-                        self.status_var.set("Stopped (limit reached)")
-                    elif reason == "recording_error":
-                        self.status_var.set("Stopped (recording error)")
-                self._apply_window_presentation()
-
-            if event == "audio_quality":
-                verdict = str(data)
-                message = str(meta)
-                colors = {
-                    "good": "#4ade80",
-                    "quiet": "#facc15",
-                    "very_quiet": "#fb923c",
-                    "clipping": "#fb923c",
-                    "silent": "#f87171",
-                }
-                self.mic_quality_var.set(message)
-                self.mic_quality_label.configure(fg=colors.get(verdict, "#64748b"))
-
-            if event == "ollama_models":
-                names = list(data) if isinstance(data, (list, tuple)) else []
-                if names:
-                    self.ollama_combo["values"] = names
-                    current = self.config.ollama_model()
-                    if current in names:
-                        self.ollama_model_var.set(current)
-
-            if event == "transcript":
-                text = str(data)
-                route = str(meta)
-                if text:
-                    self.transcript_box.configure(state="normal")
-                    self.transcript_box.delete("1.0", "end")
-                    self.transcript_box.insert("1.0", text)
-                    self.transcript_box.configure(state="disabled")
-                route_label = {
-                    "recognized": "Ready: transcript recognized.",
-                    "focused_target": "Ready: inserted into original focused field.",
-                    "focused_current_target": "Ready: inserted into current focused field.",
-                    "focused_target_pasted": "Ready: pasted into original focused field.",
-                    "ydotool_typed": "Ready: typed into current focus (virtual keyboard).",
-                    "clipboard": "Ready: copied to clipboard.",
-                    "clipboard+pasted": "Ready: copied and pasted into current focus.",
-                    "clipboard_only": "Ready: copied to clipboard. Auto-paste failed.",
-                    "gui_only": "Ready: stored in GUI transcript box.",
-                    "awaiting_target": "Waiting: choose a target window.",
-                    "empty": "Ready: no text detected.",
-                }.get(route, "Transcript processed.")
-                self.status_var.set(route_label)
-                self.route_var.set(route_label)
-                # Focus is restored by the delivery thread after routing. Do
-                # not schedule GUI-thread focus timers here: the preview event
-                # arrives before paste, and the final event may arrive after
-                # the user has intentionally moved to another application.
-
-            if event == "show":
-                self._show_window(active=bool(meta) if meta is not None else True)
-
-    def _update_elapsed(self) -> None:
-        recording = self.controller.is_recording()
-        transcribing = self.controller.is_transcribing()
-        current = getattr(self, "_visual_state", "idle")
-
-        # The transcribing phase has no controller event of its own, so the
-        # 200ms tick keeps the bar in sync with it.
-        if not recording and transcribing and current != "transcribing":
-            self.status_var.set("Transcribing…")
-            self._set_visual_state("transcribing")
-        elif not recording and not transcribing and current == "transcribing":
-            self.status_var.set("Idle")
-            self._set_visual_state("idle")
-
-        if current == "recording":
-            # Blink the dot roughly every 600ms so recording is unmissable.
-            self._blink_tick = getattr(self, "_blink_tick", 0) + 1
-            if self._blink_tick % 3 == 0:
-                fill = self.dot.itemcget(self.dot_indicator, "fill")
-                self.dot.itemconfig(
-                    self.dot_indicator,
-                    fill="#7f1d1d" if fill == "#f87171" else "#f87171",
-                )
-
-        if not recording:
-            self.elapsed_var.set("00:00")
-            return
-
-        elapsed = max(0, int(time.time() - self.controller.started_at()))
-        mins, secs = divmod(elapsed, 60)
-        self.elapsed_var.set(f"{mins:02d}:{secs:02d}")
-
-    def _show_window(self, active: bool = True) -> None:
-        try:
-            # Hotkey path asks for passive show. If the panel is already visible,
-            # do not re-show/deiconify it (that can steal focus in some WMs).
-            if not active:
-                try:
-                    if self.root.state() == "normal" and self.root.winfo_viewable():
-                        self._apply_window_presentation()
-                        self._schedule_passive_show_focus_restore()
-                        return
-                except Exception:
-                    pass
-            self.root.deiconify()
-            self._apply_window_presentation()
-            if active:
-                self.root.lift()
-            else:
-                # Immediately try to push compositor focus back to the original
-                # app so our utility window doesn't steal keyboard input.
-                self._restore_compositor_focus_immediately()
-                self._schedule_passive_show_focus_restore()
-        except Exception:
-            pass
-
-    def _restore_compositor_focus_immediately(self) -> None:
-        """Push compositor focus back to the original target right after GUI show."""
-        target = self.controller._focus_target or self.controller._focus_target_at_start
-        if target is None:
-            target = self.controller._recent_focus_target(max_age_seconds=1.0)
-        if target is not None and target.source_pid is not None and target.source_pid != os.getpid():
-            activate_window_by_pid(target.source_pid)
-
-    def _schedule_passive_show_focus_restore(self) -> None:
-        # Retry a few times because compositor timing can vary.
-        for delay_ms in (80, 220, 500, 900):
-            self.root.after(delay_ms, self._restore_external_focus_after_hotkey_show)
-
-    def _restore_external_focus_after_hotkey_show(self) -> None:
-        try:
-            self.controller.restore_last_external_focus(max_age_seconds=1.0)
-        except Exception:
-            pass
-
-    def _on_close(self) -> None:
-        if self.controller.is_recording():
-            self.controller.stop_recording(reason="gui_closed")
-        self.ipc.stop()
-        self.root.destroy()
-
-    def run(self) -> None:
-        self.root.mainloop()
 
 
 def send_ipc_raw(
@@ -5296,7 +4594,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Offline voice typing controller")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    gui_parser = sub.add_parser("gui", help="Run small recording GUI")
+    gui_parser = sub.add_parser("gui", help="Open Voice Studio (dictation + reader window)")
     gui_parser.add_argument("--toggle-on-launch", action="store_true")
 
     sub.add_parser("toggle", help="Toggle recording via IPC (for hotkey)")
@@ -5346,23 +4644,12 @@ def main() -> int:
     if args.command == "gui":
         if reuse_existing_gui_instance(toggle_on_launch=bool(args.toggle_on_launch)):
             return 0
-        startup_focus_target = None
-        startup_focus_hint: dict[str, Any] | None = None
-        focus_hint_env = os.environ.get("VOICE_TYPING_FOCUS_HINT", "").strip()
-        if focus_hint_env:
-            try:
-                parsed = json.loads(focus_hint_env)
-                if isinstance(parsed, dict):
-                    startup_focus_hint = parsed
-            except Exception:
-                startup_focus_hint = None
-        app = VoiceTypingGui(
-            toggle_on_launch=bool(args.toggle_on_launch),
-            startup_focus_target=startup_focus_target,
-            startup_focus_hint=startup_focus_hint,
-        )
-        app.run()
-        return 0
+        # Voice Studio hosts dictation and reading in one window; exec keeps
+        # this PID (systemd) and the VOICE_TYPING_FOCUS_HINT environment.
+        studio_argv = [sys.executable, str(SCRIPT_DIR / "voice_studio.py")]
+        if args.toggle_on_launch:
+            studio_argv.append("--dictate-on-launch")
+        os.execv(sys.executable, studio_argv)
     if args.command == "toggle":
         return cmd_toggle()
     if args.command == "start":
