@@ -1,5 +1,5 @@
 [Unit]
-Description=Voice Typing GUI Controller
+Description=Voice Studio (dictation + read-aloud)
 After=graphical-session.target
 Wants=graphical-session.target
 

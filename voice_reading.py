@@ -26,11 +26,9 @@ import tempfile
 import urllib.error
 import urllib.request
 import wave
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-
-import tkinter as tk
-from tkinter import messagebox, ttk
 
 APP_NAME = "Voice Reading"
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -67,9 +65,12 @@ def resolve_config_dir() -> Path:
 CONFIG_DIR = resolve_config_dir()
 CONFIG_PATH = CONFIG_DIR / "reading_config.json"
 
+PIPER_KEEP_WARM_SECONDS_DEFAULT = 300
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "engine": "spd-say",
     "output_module": "",
+    "audio_output_device": "",
     "piper_model": "",
     "piper_gpu_enabled": False,
     "piper_gpu_binary_path": str(Path.home() / "piper-gpu" / "bin" / "piper"),
@@ -90,11 +91,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "show_panel_on_hotkey": True,
     "window_always_on_top": False,
     "window_opacity": 0.95,
-    "ultra_precise_highlight_sync": False,
     "reading_preprocess_mode": "off",
     "code_math_reading_mode": False,
     "highlight_words_enabled": False,
     "highlight_sentences_enabled": True,
+    "highlight_passage_enabled": True,
+    # Seconds between starting the audio player and hearing it.
+    "highlight_delay_seconds": 0.06,
+    "piper_keep_warm_seconds": PIPER_KEEP_WARM_SECONDS_DEFAULT,
 }
 
 PREPROCESS_MODE_OFF = "off"
@@ -109,6 +113,10 @@ PREPROCESS_MODE_LABELS = {
 }
 PREPROCESS_MODE_LABEL_TO_KEY = {label: key for key, label in PREPROCESS_MODE_LABELS.items()}
 PREPROCESS_MODE_KEYS = set(PREPROCESS_MODE_LABELS.keys())
+
+# Sink-input properties that mark a stream as ours when it comes from the
+# speech-dispatcher daemon rather than from a player we started ourselves.
+SPEECH_STREAM_HINTS = ("speech-dispatcher", "speechd", "voice-reading")
 
 VOICE_TYPES = [
     "male1",
@@ -558,14 +566,6 @@ def preprocess_text_for_mode(text: str, mode: str) -> tuple[str, bool, str]:
     return text.strip(), False, PREPROCESS_MODE_OFF
 
 
-def split_sentences_for_timing(text: str) -> list[str]:
-    clean = text.strip()
-    if not clean:
-        return []
-    parts = re.findall(r"[^.!?]+[.!?]*", clean, flags=re.S)
-    return [p.strip() for p in parts if p.strip()]
-
-
 def detect_engines(config: "ConfigManager | None" = None) -> list[str]:
     engines: list[str] = []
     if shutil.which("spd-say"):
@@ -827,18 +827,111 @@ def piper_model_matches_language(path_str: str, language: str) -> bool:
     return bool(path_str) and piper_model_family(path_str) == normalize_language_family(language)
 
 
-def list_audio_player_commands(wav_path: str) -> list[list[str]]:
+def list_output_devices() -> list[tuple[str, str]]:
+    """Available sinks as (name, description), best-effort.
+
+    An empty name means "whatever the system default is", which is the entry
+    the reader starts on. The list is rebuilt every time the dropdown opens,
+    because Bluetooth and HDMI outputs appear and disappear while it runs.
+    """
+    devices: list[tuple[str, str]] = [("", "System default")]
+    if shutil.which("pactl") is None:
+        return devices
+    rc, out, _ = _run_capture(["pactl", "list", "sinks"], timeout=2.0)
+    if rc != 0:
+        return devices
+    name = ""
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Name:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("Description:") and name:
+            devices.append((name, line.split(":", 1)[1].strip()))
+            name = ""
+    return devices
+
+
+def audio_output_env(device: str) -> dict[str, str] | None:
+    """Environment that pins a child process to one PulseAudio sink."""
+    device = device.strip()
+    if not device:
+        return None
+    env = os.environ.copy()
+    env["PULSE_SINK"] = device
+    return env
+
+
+def _sink_inputs_matching(hints: tuple[str, ...]) -> list[str]:
+    """Indices of playback streams whose properties mention any of `hints`."""
+    rc, out, _ = _run_capture(["pactl", "list", "sink-inputs"], timeout=2.0)
+    if rc != 0:
+        return []
+    indices: list[str] = []
+    index = ""
+    block: list[str] = []
+    for line in out.splitlines() + ["Sink Input #"]:
+        stripped = line.strip()
+        if stripped.startswith("Sink Input #"):
+            if index and any(hint in "\n".join(block).lower() for hint in hints):
+                indices.append(index)
+            index = stripped.split("#", 1)[1].strip()
+            block = []
+        else:
+            block.append(stripped)
+    return indices
+
+
+def route_speech_to_output_device(device: str, timeout: float = 2.0) -> None:
+    """Move speech-dispatcher playback onto the chosen sink, best effort.
+
+    speech-dispatcher speaks through its own daemon, so unlike paplay it cannot
+    be pointed at a sink up front; its stream is moved once it shows up.
+    """
+    device = device.strip()
+    if not device or shutil.which("pactl") is None:
+        return
+    deadline = time.monotonic() + timeout
+    moved: set[str] = set()
+    while time.monotonic() < deadline:
+        # speech-dispatcher opens its streams in stages, so keep watching for
+        # the whole window instead of stopping at the first one moved.
+        for index in _sink_inputs_matching(SPEECH_STREAM_HINTS):
+            if index in moved:
+                continue
+            rc, _, _ = _run_capture(["pactl", "move-sink-input", index, device], timeout=2.0)
+            if rc == 0:
+                moved.add(index)
+        time.sleep(0.1)
+
+
+def list_audio_player_commands(wav_path: str, device: str = "") -> list[list[str]]:
+    """Players to try in order; `device` is a sink name ("" = system default)."""
+    device = device.strip()
+    pw_cmd = ["pw-play"] + ([f"--target={device}"] if device else []) + [wav_path]
+    pa_cmd = ["paplay"] + ([f"--device={device}"] if device else []) + [wav_path]
     commands: list[list[str]] = []
-    if shutil.which("pw-play"):
-        commands.append(["pw-play", wav_path])
-    if shutil.which("aplay"):
-        commands.append(["aplay", "-q", wav_path])
-    if shutil.which("paplay"):
-        commands.append(["paplay", wav_path])
+    if device:
+        # paplay speaks the same sink names as `pactl list sinks`, so it honours
+        # an explicit choice most reliably; aplay is skipped because its ALSA
+        # device names do not match those sinks at all.
+        if shutil.which("paplay"):
+            commands.append(pa_cmd)
+        if shutil.which("pw-play"):
+            commands.append(pw_cmd)
+    else:
+        if shutil.which("pw-play"):
+            commands.append(pw_cmd)
+        if shutil.which("aplay"):
+            commands.append(["aplay", "-q", wav_path])
+        if shutil.which("paplay"):
+            commands.append(pa_cmd)
     if shutil.which("ffplay"):
         commands.append(["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", wav_path])
     if shutil.which("mpv"):
-        commands.append(["mpv", "--really-quiet", "--no-video", wav_path])
+        mpv_cmd = ["mpv", "--really-quiet", "--no-video"]
+        if device:
+            mpv_cmd.append(f"--audio-device=pulse/{device}")
+        commands.append(mpv_cmd + [wav_path])
     return commands
 
 
@@ -851,7 +944,6 @@ def choose_preferred_piper_model(model_paths: list[str]) -> str:
         "en_GB-alba-medium",
         "en_GB-aru-medium",
     ]
-    lower_map = {p.lower(): p for p in model_paths}
     for pref in priorities:
         for p in model_paths:
             if pref.lower() in p.lower():
@@ -1031,34 +1123,208 @@ def prepare_piper_text(text: str, model_path: str) -> tuple[str, str]:
         return "", f"Hebrew text preparation failed: {exc}"
 
 
+# Document reading: the Reader text is spoken passage by passage. Passages
+# ahead of the one playing are synthesized in the background, so text pasted
+# below the current passage continues without a gap.
+READER_LOOKAHEAD_PASSAGES = 4
+READER_LOOKAHEAD_CHARS = 2400
+READER_FIRST_PASSAGE_CHARS = 220
+READER_PASSAGE_CHARS = 450
+READER_PASSAGE_MIN_CHARS = 160
+
+_PASSAGE_BOUNDARY_RE = re.compile(r"[.!?…]+[\"”’')\]]*(?=\s|$)|\n")
+
+
+def next_passage_cut(text: str, max_chars: int, min_chars: int) -> tuple[int, bool]:
+    """Offset where the next spoken passage of text ends.
+
+    Passages end after a sentence or a line break, once they hold min_chars,
+    and never pass max_chars unless no boundary exists. A blank line always
+    ends one. Returns (cut, complete); complete is False when the passage
+    runs to the end of text with no sentence end, i.e. it may still be typed.
+    """
+    length = len(text)
+    if length == 0:
+        return 0, True
+    cut = 0
+    for match in _PASSAGE_BOUNDARY_RE.finditer(text):
+        end = match.end()
+        if end > max_chars:
+            break
+        cut = end
+        paragraph_break = match.group(0) == "\n" and text[end : end + 1] == "\n"
+        if cut >= min_chars or paragraph_break:
+            return cut, True
+    if cut > 0:
+        return cut, True
+    if length <= max_chars:
+        return length, False
+    space = text.rfind(" ", 0, max_chars)
+    return (space + 1 if space > 0 else max_chars), True
+
+
+@dataclass
+class SpeechPassage:
+    passage_id: int
+    text: str
+    speak_text: str
+    words: list[str] = field(default_factory=list)
+    wav_path: str = ""
+    duration: float = 0.0
+    # [start, end] seconds per word, from the voice's phoneme durations.
+    word_times: list[list[float]] | None = None
+    state: str = "pending"  # pending -> ready | failed
+    error: str = ""
+
+
+@dataclass
+class ReadingSession:
+    session_id: int
+    settings: dict[str, Any]
+    passages: list[SpeechPassage] = field(default_factory=list)
+    play_index: int = 0
+    playing_id: int | None = None
+    exhausted: bool = False
+    cancelled: bool = False
+    paused: bool = False
+    replay_current: bool = False
+    player: subprocess.Popen[str] | None = None
+    cond: threading.Condition = field(default_factory=threading.Condition)
+
+
+class PiperSynthServer:
+    """A warm piper process in --json-input mode: one line in, one WAV out.
+
+    Loading a voice costs ~0.5s on CPU and ~2.5s for the CUDA wrapper, which
+    per-passage launches would pay every time.
+    """
+
+    def __init__(self, binary: str, model: str, length_scale: float) -> None:
+        self.key = (binary, model, round(length_scale, 3))
+        self._lines: "queue.Queue[str | None]" = queue.Queue()
+        self._lock = threading.Lock()
+        self.last_used = time.monotonic()
+        self._proc = subprocess.Popen(
+            [
+                binary,
+                "--model",
+                model,
+                "--json-input",
+                "--output_dir",
+                tempfile.gettempdir(),
+                "--length_scale",
+                f"{length_scale:.3f}",
+                "--quiet",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+
+    def _read_stdout(self) -> None:
+        stdout = self._proc.stdout
+        if stdout is None:
+            return
+        try:
+            for line in stdout:
+                self._lines.put(line.strip())
+        except Exception:
+            pass
+        self._lines.put(None)
+
+    def alive(self) -> bool:
+        return self._proc.poll() is None
+
+    def synthesize(self, text: str, out_path: str, timeout: float = 180.0) -> tuple[str, list[list[float]] | None]:
+        """Write text to out_path; returns (error or "", word times or None).
+
+        Word times come only from tools/piper_gpu_wrapper.py; the C++ piper
+        ignores the "alignments" key and answers with the path alone."""
+        request = {"text": text, "output_file": out_path, "alignments": True}
+        with self._lock:
+            if not self.alive():
+                return "Piper process exited", None
+            try:
+                assert self._proc.stdin is not None
+                self._proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+                self._proc.stdin.flush()
+            except Exception as exc:
+                return f"Piper input failed: {exc}", None
+            try:
+                line = self._lines.get(timeout=timeout)
+            except queue.Empty:
+                # A late reply would be paired with the next request.
+                self.close()
+                return "Piper timed out", None
+            self.last_used = time.monotonic()
+        if line is None:
+            return "Piper process exited", None
+        if line.startswith("ERROR"):
+            return line, None
+        word_times = None
+        if line.startswith("{"):
+            try:
+                reply = json.loads(line)
+                raw_times = reply.get("word_times")
+                if isinstance(raw_times, list):
+                    word_times = [[float(t[0]), float(t[1])] for t in raw_times]
+            except Exception:
+                word_times = None
+        if not os.path.exists(out_path):
+            return f"Piper did not write audio ({line[:120]})", None
+        return "", word_times
+
+    def close(self) -> None:
+        try:
+            if self._proc.stdin is not None:
+                self._proc.stdin.close()
+        except Exception:
+            pass
+        if self._proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
+
+
 class ReaderController:
+    """Reads text aloud passage by passage (see ReadingSession) and
+    translates text with local Gemma through Ollama."""
+
     def __init__(
         self,
         config: ConfigManager,
         on_state_change: Callable[[bool, str], None] | None = None,
-        on_text: Callable[[str, str], None] | None = None,
-        on_progress: Callable[[int, int], None] | None = None,
         on_translation: Callable[[str, str, str], None] | None = None,
+        on_passage: Callable[[int, int, int], None] | None = None,
+        on_need_text: Callable[[], None] | None = None,
     ) -> None:
         self.config = config
         self.on_state_change = on_state_change
-        self.on_text = on_text
-        self.on_progress = on_progress
         self.on_translation = on_translation
+        self.on_passage = on_passage
+        self.on_need_text = on_need_text
+        # Set by the Reader window: reads then load the text there, and the
+        # window feeds it back passage by passage; called as
+        # (text, source, language, session_id).
+        self.document_host: Callable[[str, str, str | None, int], None] | None = None
+        self._session: ReadingSession | None = None
+        self._piper_server: PiperSynthServer | None = None
+        self._piper_server_lock = threading.Lock()
+        self._piper_reaper_started = False
+        self._piper_json_unsupported: set[str] = set()
+        self._passage_audio_counter = 0
         self._lock = threading.Lock()
         self._speaking = False
-        self._proc: subprocess.Popen[str] | None = None
-        self._last_source = "none"
         self._paused = False
-        self._resume_text = ""
-        self._resume_word_index = 0
-        self._full_words: list[str] = []
-        self._word_total = 0
-        self._word_index = -1
-        self._cancel_reason = ""
-        self._cancel_state_pre_emitted = False
-        self._progress_stop = threading.Event()
-        self._progress_thread: threading.Thread | None = None
+        self._last_source = "none"
         self._run_id = 0
         self._last_text = ""
         self._last_translation = ""
@@ -1078,33 +1344,49 @@ class ReaderController:
     def read_selection_async(self) -> tuple[bool, str]:
         if self.is_speaking():
             self.stop()
-
         text, source = get_selected_text(self.config)
         if not text:
             return False, "No selected text found"
         self._last_text = text.strip()
-        preprocess_mode = resolve_preprocess_mode(self.config)
-        processed, changed, mode_used = preprocess_text_for_mode(text, preprocess_mode)
-        speak_text = processed if processed else text
-        words = re.findall(r"\S+", speak_text)
-        with self._lock:
-            self._paused = False
-            self._resume_text = ""
-            self._resume_word_index = 0
-            self._full_words = words
-            self._word_total = len(words)
-            self._word_index = 0 if words else -1
         self._last_source = source
-        if mode_used == PREPROCESS_MODE_OFF:
-            ui_source = source
-        elif changed:
-            ui_source = f"{source}+{mode_used}"
+        return self._read_text(text, source, None)
+
+    def speak_text_async(self, text: str, language: str | None = None) -> tuple[bool, str]:
+        """Speak text without recapturing the system selection."""
+        text = text.strip()
+        if not text:
+            return False, "Nothing to speak"
+        self._last_source = "translation"
+        return self._read_text(text, "translation", language)
+
+    def _read_text(self, text: str, source: str, language: str | None) -> tuple[bool, str]:
+        session_id = self.begin_document_session(language=language)
+        if self.document_host is not None:
+            self.document_host(text, source, language, session_id)
         else:
-            ui_source = f"{source}+{mode_used}(no_change)"
-        self._emit_text(speak_text, ui_source)
-        if words:
-            self._emit_progress(0, len(words))
-        return self._start_async(speak_text, start_word_index=0)
+            self._enqueue_whole_text(session_id, text)
+        return True, "Reading started"
+
+    def _enqueue_whole_text(self, session_id: int, text: str) -> None:
+        """Without a Reader window, queue the whole text at once."""
+        mode = resolve_preprocess_mode(self.config)
+        rest = text
+        passage_id = 0
+        while rest.strip():
+            rest = rest.lstrip()
+            first = passage_id == 0
+            cut, _complete = next_passage_cut(
+                rest,
+                READER_FIRST_PASSAGE_CHARS if first else READER_PASSAGE_CHARS,
+                1 if first else READER_PASSAGE_MIN_CHARS,
+            )
+            if cut <= 0:
+                break
+            passage, rest = rest[:cut].strip(), rest[cut:]
+            passage_id += 1
+            processed, _changed, _mode = preprocess_text_for_mode(passage, mode)
+            self.enqueue_passage(session_id, passage_id, passage, processed or passage)
+        self.set_session_exhausted(session_id, True)
 
     def translate_selection_async(self, target_language: str, speak_aloud: bool = False) -> tuple[bool, str]:
         """Translate the last captured/selected text using the local Ollama model."""
@@ -1119,6 +1401,22 @@ class ReaderController:
         if not text:
             return False, "No selected text found"
         self._last_text = text
+        return self.translate_text_async(text, target_language, speak_aloud=speak_aloud, source=source)
+
+    def translate_text_async(
+        self,
+        text: str,
+        target_language: str,
+        speak_aloud: bool = False,
+        source: str = "reader text",
+    ) -> tuple[bool, str]:
+        """Translate given text with the local Ollama model."""
+        target_language = target_language.strip()
+        text = text.strip()
+        if not target_language:
+            return False, "Choose a target language first"
+        if not text:
+            return False, "Nothing to translate"
         previous_active = False
         with self._translation_lock:
             previous_event = self._translation_cancel
@@ -1304,27 +1602,6 @@ class ReaderController:
             return "", "Gemma returned an empty translation"
         return result, None
 
-    def speak_text_async(self, text: str, language: str | None = None) -> tuple[bool, str]:
-        """Speak text without recapturing the system selection."""
-        text = text.strip()
-        if not text:
-            return False, "Nothing to speak"
-        if self.is_speaking():
-            self.stop()
-        words = re.findall(r"\S+", text)
-        with self._lock:
-            self._paused = False
-            self._resume_text = ""
-            self._resume_word_index = 0
-            self._full_words = words
-            self._word_total = len(words)
-            self._word_index = 0 if words else -1
-        self._last_source = "translation"
-        self._emit_text(text, "translation")
-        if words:
-            self._emit_progress(0, len(words))
-        return self._start_async(text, start_word_index=0, language_override=language)
-
     def _emit_translation(self, text: str, target_language: str, meta: str) -> None:
         if self.on_translation is not None:
             self.on_translation(text, target_language, meta)
@@ -1352,58 +1629,12 @@ class ReaderController:
             except Exception:
                 pass
 
-    def _is_current_run(self, run_id: int) -> bool:
-        with self._lock:
-            return run_id == self._run_id
-
-    def _start_async(
-        self,
-        text: str,
-        start_word_index: int = 0,
-        language_override: str | None = None,
-    ) -> tuple[bool, str]:
-        with self._lock:
-            if self._speaking:
-                return False, "Already reading"
-            self._run_id += 1
-            run_id = self._run_id
-            self._speaking = True
-            self._paused = False
-            self._cancel_reason = ""
-            self._cancel_state_pre_emitted = False
-        self._emit_state(True, "reading")
-        threading.Thread(
-            target=self._worker,
-            args=(text, start_word_index, run_id, language_override),
-            daemon=True,
-        ).start()
-        return True, "Reading started"
-
     def stop(self) -> tuple[bool, str]:
         with self._lock:
-            speaking = self._speaking
-            proc = self._proc
-        if not speaking:
+            session = self._session
+        if session is None:
             return False, "Not reading"
-
-        self._progress_stop.set()
-        try:
-            if shutil.which("spd-say"):
-                subprocess.run(["spd-say", "-S"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        with self._lock:
-            self._run_id += 1
-            self._speaking = False
-            self._proc = None
-            self._paused = False
-            self._resume_text = ""
-            self._resume_word_index = 0
-            self._cancel_reason = "stopped"
-            self._cancel_state_pre_emitted = True
-        if proc is not None:
-            self._terminate_process(proc)
-        self._emit_state(False, "stopped")
+        self._end_session(session, "stopped")
         return True, "Stopped"
 
     def toggle(self) -> tuple[bool, str]:
@@ -1418,105 +1649,23 @@ class ReaderController:
 
     def pause(self) -> tuple[bool, str]:
         with self._lock:
-            speaking = self._speaking
-            proc = self._proc
-            total_words = self._word_total
-            word_index = self._word_index
-            words = list(self._full_words)
-        if not speaking:
+            session = self._session
+        if session is None:
             return False, "Not reading"
-
-        self._progress_stop.set()
-        try:
-            if shutil.which("spd-say"):
-                subprocess.run(["spd-say", "-S"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-
-        next_index = min(total_words, max(0, word_index + 1))
-        remaining = words[next_index:] if words else []
-        with self._lock:
-            self._run_id += 1
-            self._speaking = False
-            self._proc = None
-            self._paused = bool(remaining)
-            self._resume_word_index = next_index
-            self._resume_text = " ".join(remaining) if remaining else ""
-            self._cancel_reason = "paused"
-            self._cancel_state_pre_emitted = True
-        if proc is not None:
-            self._terminate_process(proc)
-        if remaining:
-            self._emit_state(False, "paused")
-            self._emit_progress(next_index, total_words)
-            return True, "Paused"
-        self._emit_state(False, "done")
-        return True, "Done"
+        return self._pause_session(session)
 
     def resume(self) -> tuple[bool, str]:
         with self._lock:
-            if self._speaking:
-                return False, "Already reading"
-            if not self._paused:
-                return False, "Not paused"
-            resume_text = self._resume_text
-            start_idx = self._resume_word_index
-        if not resume_text.strip():
-            return False, "Nothing to resume"
-        return self._start_async(resume_text, start_word_index=start_idx)
+            session = self._session
+        if session is None:
+            return False, "Not paused"
+        return self._resume_session(session)
 
     def _estimate_words_per_minute(self, engine: str, rate: int, piper_length_scale: float) -> float:
         base = max(90, min(420, 175 + (rate * 2)))
         if engine == "piper":
             return max(80.0, min(500.0, float(base) / max(0.35, piper_length_scale)))
         return float(base)
-
-    def _start_progress_tracker(
-        self,
-        start_index: int,
-        total_words: int,
-        wpm: float,
-        total_duration_sec: float | None = None,
-        word_offsets_sec: list[float] | None = None,
-        start_delay_sec: float = 0.0,
-    ) -> None:
-        self._progress_stop.set()
-        self._progress_stop = threading.Event()
-        if total_words <= 0:
-            return
-
-        def _run() -> None:
-            remaining_words = max(1, total_words - max(0, start_index))
-            offsets = list(word_offsets_sec) if word_offsets_sec else []
-            if not offsets:
-                if total_duration_sec is not None and total_duration_sec > 0:
-                    sec_per_word = max(0.02, float(total_duration_sec) / float(remaining_words))
-                else:
-                    sec_per_word = max(0.05, 60.0 / max(60.0, wpm))
-            else:
-                sec_per_word = 0.0
-            started = time.monotonic()
-            last_idx = -1
-            while not self._progress_stop.wait(0.08):
-                with self._lock:
-                    speaking = self._speaking
-                if not speaking:
-                    break
-                elapsed = max(0.0, time.monotonic() - started - max(0.0, start_delay_sec))
-                if offsets:
-                    rel_idx = bisect.bisect_right(offsets, elapsed) - 1
-                    rel_idx = max(0, min(remaining_words - 1, rel_idx))
-                    idx = min(total_words - 1, start_index + rel_idx)
-                else:
-                    idx = min(total_words - 1, start_index + int(elapsed / sec_per_word))
-                if idx != last_idx:
-                    with self._lock:
-                        self._word_index = idx
-                    self._emit_progress(idx, total_words)
-                    last_idx = idx
-
-        self._progress_thread = threading.Thread(target=_run, daemon=True)
-        self._progress_thread.start()
 
     def _estimate_word_weight(self, token: str) -> float:
         cleaned = re.sub(r"[^A-Za-z]", "", token).lower()
@@ -1552,60 +1701,6 @@ class ReaderController:
             acc += w * scale
         return offsets
 
-    def _estimate_word_offsets_by_sentence(
-        self,
-        text: str,
-        total_words: list[str],
-        sentence_durations: list[float],
-    ) -> list[float]:
-        if not total_words or not sentence_durations:
-            return []
-        sentences = split_sentences_for_timing(text)
-        if not sentences:
-            return []
-        pair_count = min(len(sentences), len(sentence_durations))
-        if pair_count <= 0:
-            return []
-        offsets: list[float] = []
-        abs_t = 0.0
-        word_cursor = 0
-        for idx in range(pair_count):
-            sent = sentences[idx]
-            dur = max(0.02, float(sentence_durations[idx]))
-            sent_words = re.findall(r"\S+", sent)
-            if not sent_words:
-                abs_t += dur
-                continue
-            local = self._estimate_word_offsets(sent_words, dur)
-            for local_t in local:
-                if word_cursor >= len(total_words):
-                    break
-                offsets.append(abs_t + local_t)
-                word_cursor += 1
-            abs_t += dur
-            if word_cursor >= len(total_words):
-                break
-        if word_cursor < len(total_words):
-            rem = len(total_words) - word_cursor
-            step = 0.16
-            for i in range(rem):
-                offsets.append(abs_t + (i * step))
-        return offsets[: len(total_words)]
-
-    def _parse_piper_sentence_durations(self, stderr_text: str) -> list[float]:
-        if not stderr_text:
-            return []
-        vals: list[float] = []
-        for line in stderr_text.splitlines():
-            m = re.search(r"Synthesized\s+([0-9]+(?:\.[0-9]+)?)\s+second\(s\)\s+of\s+audio", line)
-            if not m:
-                continue
-            try:
-                vals.append(float(m.group(1)))
-            except Exception:
-                continue
-        return vals
-
     def _wav_duration_seconds(self, wav_path: str) -> float | None:
         try:
             with wave.open(wav_path, "rb") as wf:
@@ -1617,278 +1712,597 @@ class ReaderController:
         except Exception:
             return None
 
-    def _worker(
-        self,
-        text: str,
-        start_word_index: int,
-        run_id: int,
-        language_override: str | None = None,
-    ) -> None:
-        engine = str(self.config.get("engine", "spd-say")).strip() or "spd-say"
-        output_module = str(self.config.get("output_module", "")).strip()
-        piper_model = str(self.config.get("piper_model", "")).strip()
-        rate = int(self.config.get("rate", 0))
-        pitch = int(self.config.get("pitch", 0))
-        language = str(language_override or self.config.get("language", "en")).strip()
-        speech_language = normalize_language_family(language)
-        voice = str(self.config.get("voice", "")).strip()
-        voice_type = str(self.config.get("voice_type", "male1")).strip()
-        ultra_sync = bool(self.config.get("ultra_precise_highlight_sync", False))
-        sentence_sync = bool(self.config.get("highlight_sentences_enabled", True))
-
-        rc = 1
-        err_text = ""
-        proc: subprocess.Popen[str] | None = None
-        proc_input: str | None = None
-        wav_to_remove: str | None = None
-        already_waited = False
-        cancelled_reason = ""
-        cancel_state_pre_emitted = False
-        length_scale = 1.0
-        with self._lock:
-            total_words = self._word_total
-            full_words = list(self._full_words)
-        selected_model = ""
-        if engine == "piper":
-            models = list_piper_model_paths()
-            if piper_model and piper_model_matches_language(piper_model, language):
-                selected_model = piper_model
-            else:
-                selected_model = choose_piper_model_for_language(models, language)
-            if not selected_model:
-                # The bundled Piper catalog has no Hebrew voice. Prefer a
-                # system voice for that language instead of speaking Hebrew
-                # through an English model.
-                if shutil.which("espeak-ng"):
-                    fallback_engine = "espeak-ng"
-                elif shutil.which("espeak"):
-                    fallback_engine = "espeak"
-                else:
-                    fallback_engine = "spd-say"
-                if shutil.which(fallback_engine):
-                    log_line(
-                        f"tts: no Piper voice for language={language!r}; falling back to {fallback_engine}"
-                    )
-                    engine = fallback_engine
-        if total_words <= 0:
-            full_words = re.findall(r"\S+", text)
-            total_words = len(full_words)
-        remaining_words = full_words[max(0, start_word_index):]
-        if engine != "piper":
-            wpm_est = self._estimate_words_per_minute(engine, rate, piper_length_scale=length_scale)
-            est_duration = max(0.05, len(remaining_words) * (60.0 / max(60.0, wpm_est)))
-            offsets = self._estimate_word_offsets(remaining_words, est_duration) if ultra_sync else []
-            self._start_progress_tracker(
-                start_index=max(0, start_word_index),
-                total_words=total_words,
-                wpm=wpm_est,
-                total_duration_sec=est_duration,
-                word_offsets_sec=offsets,
-                start_delay_sec=0.06 if ultra_sync else 0.0,
-            )
-        try:
-            if engine == "spd-say" and shutil.which("spd-say"):
-                cmd = ["spd-say", "-w", "-r", str(rate), "-p", str(pitch), "-N", "voice-reading", "-n", "main"]
-                if output_module:
-                    cmd.extend(["-o", output_module])
-                if speech_language:
-                    cmd.extend(["-l", speech_language])
-                if voice_type:
-                    cmd.extend(["-t", voice_type])
-                if voice:
-                    cmd.extend(["-y", voice])
-                cmd.append(text)
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                    text=True,
-                )
-                if not self._is_current_run(run_id):
-                    self._terminate_process(proc)
-                    return
-            elif engine in {"espeak-ng", "espeak"} and shutil.which(engine):
-                # Map -100..100 onto a useful words-per-minute range.
-                wpm = max(90, min(420, 175 + (rate * 2)))
-                cmd = [engine, "-s", str(wpm), "-p", str(max(0, min(99, 50 + pitch // 2))), "--stdin"]
-                if voice:
-                    cmd.extend(["-v", voice])
-                elif speech_language:
-                    cmd.extend(["-v", speech_language])
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                    text=True,
-                )
-                if not self._is_current_run(run_id):
-                    self._terminate_process(proc)
-                    return
-                proc_input = text
-            elif engine == "piper":
-                piper_bin = resolve_piper_binary(self.config)
-                if not piper_bin:
-                    err_text = "Piper engine not found"
-                    proc = None
-                else:
-                    piper_input = text
-                    if selected_model:
-                        piper_input, preparation_error = prepare_piper_text(text, selected_model)
-                        if preparation_error:
-                            err_text = preparation_error
-                            selected_model = ""
-                    if not selected_model:
-                        if not err_text:
-                            err_text = "No Piper model found. Add a .onnx voice model."
-                    else:
-                        # lower length_scale => faster; keep range conservative for intelligibility
-                        length_scale = max(0.60, min(1.60, 1.00 - (rate / 220.0)))
-                        with tempfile.NamedTemporaryFile(prefix="voice_reading_", suffix=".wav", delete=False) as tmp:
-                            wav_to_remove = tmp.name
-                        cmd = [
-                            piper_bin,
-                            "--model",
-                            selected_model,
-                            "--output_file",
-                            wav_to_remove,
-                            "--length_scale",
-                            f"{length_scale:.3f}",
-                        ]
-                        if ultra_sync or sentence_sync:
-                            cmd.append("--debug")
-                        else:
-                            cmd.append("--quiet")
-                        proc = subprocess.Popen(
-                            cmd,
-                            stdin=subprocess.PIPE,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE,
-                            start_new_session=True,
-                            text=True,
-                        )
-                        with self._lock:
-                            if run_id == self._run_id:
-                                self._proc = proc
-                        proc_input = piper_input
-                        _, stderr_text = proc.communicate(input=proc_input, timeout=None)
-                        proc_input = None
-                        rc = proc.returncode
-                        err_text = (stderr_text or "").strip()
-                        already_waited = True
-                        if rc == 0:
-                            if not self._is_current_run(run_id):
-                                return
-                            wav_duration = self._wav_duration_seconds(wav_to_remove) if wav_to_remove else None
-                            sentence_durs = self._parse_piper_sentence_durations(err_text) if (ultra_sync or sentence_sync) else []
-                            if sentence_durs:
-                                offsets = self._estimate_word_offsets_by_sentence(
-                                    text=text,
-                                    total_words=remaining_words,
-                                    sentence_durations=sentence_durs,
-                                )
-                            elif ultra_sync and wav_duration is not None and wav_duration > 0:
-                                offsets = self._estimate_word_offsets(remaining_words, wav_duration)
-                            else:
-                                offsets = []
-                            self._start_progress_tracker(
-                                start_index=max(0, start_word_index),
-                                total_words=total_words,
-                                wpm=self._estimate_words_per_minute(engine, rate, piper_length_scale=length_scale),
-                                total_duration_sec=wav_duration,
-                                word_offsets_sec=offsets,
-                                start_delay_sec=0.12 if ultra_sync else 0.04,
-                            )
-                            player_cmds = list_audio_player_commands(wav_to_remove)
-                            if not player_cmds:
-                                rc = 1
-                                err_text = "No audio player found (pw-play/aplay/paplay/ffplay/mpv)"
-                            else:
-                                last_error = ""
-                                played = False
-                                for player_cmd in player_cmds:
-                                    proc = subprocess.Popen(
-                                        player_cmd,
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.PIPE,
-                                        start_new_session=True,
-                                        text=True,
-                                    )
-                                    with self._lock:
-                                        if run_id == self._run_id:
-                                            self._proc = proc
-                                        else:
-                                            self._terminate_process(proc)
-                                            return
-                                    _, play_stderr = proc.communicate(timeout=None)
-                                    already_waited = True
-                                    if proc.returncode == 0:
-                                        rc = 0
-                                        err_text = ""
-                                        played = True
-                                        break
-                                    last_error = (play_stderr or "").strip() or f"{player_cmd[0]} failed"
-                                if not played:
-                                    rc = 1
-                                    err_text = last_error
-            else:
-                err_text = f"TTS engine not available: {engine}"
-
-            with self._lock:
-                if run_id == self._run_id:
-                    self._proc = proc
-
-            if proc is not None and not already_waited:
-                _, stderr_text = proc.communicate(input=proc_input, timeout=None)
-                rc = proc.returncode
-                err_text = (stderr_text or "").strip()
-        except Exception as exc:
-            err_text = str(exc)
-        finally:
-            self._progress_stop.set()
-            if wav_to_remove:
-                try:
-                    os.unlink(wav_to_remove)
-                except Exception:
-                    pass
-            with self._lock:
-                if run_id != self._run_id:
-                    return
-                cancelled_reason = self._cancel_reason
-                cancel_state_pre_emitted = self._cancel_state_pre_emitted
-                self._speaking = False
-                self._proc = None
-                self._cancel_reason = ""
-                self._cancel_state_pre_emitted = False
-
-        if cancelled_reason:
-            if not cancel_state_pre_emitted:
-                self._emit_state(False, cancelled_reason)
-        elif rc == 0:
-            if total_words > 0:
-                with self._lock:
-                    self._word_index = total_words - 1
-                self._emit_progress(total_words - 1, total_words)
-            self._emit_state(False, "done")
-        else:
-            detail = err_text or "TTS failed"
-            log_line(f"tts failed (engine={engine}, source={self._last_source}, detail={detail!r})")
-            notify("Voice Reading", detail, urgency="critical")
-            self._emit_state(False, "error")
-
     def _emit_state(self, speaking: bool, reason: str) -> None:
         if self.on_state_change is not None:
             self.on_state_change(speaking, reason)
 
-    def _emit_text(self, text: str, source: str) -> None:
-        if self.on_text is not None:
-            self.on_text(text, source)
+    # ------------------------------------------------------------------
+    # Document sessions: the GUI feeds passages with enqueue_passage() while
+    # earlier ones play. Passage ids belong to the GUI (it maps them to text
+    # ranges); on_passage reports (passage_id, word_index, word_total).
 
-    def _emit_progress(self, index: int, total: int) -> None:
-        if self.on_progress is not None:
-            self.on_progress(index, total)
+    def begin_document_session(self, language: str | None = None) -> int:
+        """Stop whatever is reading and start an empty session to feed."""
+        with self._lock:
+            old_session = self._session
+            classic_speaking = self._speaking and old_session is None
+        if old_session is not None:
+            self._end_session(old_session, "", emit=False)
+        elif classic_speaking:
+            self.stop()
+        settings = self._resolve_speech_settings(language)
+        with self._lock:
+            self._run_id += 1
+            session = ReadingSession(session_id=self._run_id, settings=settings)
+            self._session = session
+            self._speaking = True
+            self._paused = False
+        log_line(
+            f"session {session.session_id} start engine={settings['engine']} "
+            f"model={Path(settings['model']).name if settings['model'] else '-'} language={settings['language']!r}"
+        )
+        self._emit_state(True, "reading")
+        threading.Thread(target=self._session_play_loop, args=(session,), daemon=True).start()
+        if settings["engine"] == "piper":
+            threading.Thread(target=self._session_synth_loop, args=(session,), daemon=True).start()
+        return session.session_id
+
+    def active_session_id(self) -> int | None:
+        with self._lock:
+            return self._session.session_id if self._session is not None else None
+
+    def _session_for(self, session_id: int) -> ReadingSession | None:
+        with self._lock:
+            session = self._session
+        if session is None or session.session_id != session_id:
+            return None
+        return session
+
+    def enqueue_passage(self, session_id: int, passage_id: int, text: str, speak_text: str | None = None) -> bool:
+        session = self._session_for(session_id)
+        if session is None:
+            return False
+        speak = (text if speak_text is None else speak_text).strip()
+        passage = SpeechPassage(
+            passage_id=passage_id,
+            text=text,
+            speak_text=speak,
+            words=re.findall(r"\S+", text),
+        )
+        with session.cond:
+            if session.cancelled:
+                return False
+            session.passages.append(passage)
+            session.exhausted = False
+            session.cond.notify_all()
+        return True
+
+    def session_wants_more(self, session_id: int) -> bool:
+        session = self._session_for(session_id)
+        if session is None:
+            return False
+        with session.cond:
+            if session.cancelled:
+                return False
+            upcoming = session.passages[session.play_index :]
+            return (
+                len(upcoming) < READER_LOOKAHEAD_PASSAGES
+                and sum(len(p.speak_text) for p in upcoming) < READER_LOOKAHEAD_CHARS
+            )
+
+    def set_session_exhausted(self, session_id: int, exhausted: bool) -> None:
+        session = self._session_for(session_id)
+        if session is None:
+            return
+        with session.cond:
+            session.exhausted = exhausted
+            session.cond.notify_all()
+
+    def truncate_session(self, session_id: int, from_passage_id: int) -> list[int]:
+        """Drop from_passage_id and every later passage that has not started
+        playing (their text was edited). Returns the dropped passage ids."""
+        session = self._session_for(session_id)
+        if session is None:
+            return []
+        with session.cond:
+            index = next(
+                (i for i, p in enumerate(session.passages) if p.passage_id == from_passage_id),
+                None,
+            )
+            if index is None:
+                return []
+            first_unstarted = session.play_index + (1 if session.playing_id is not None else 0)
+            start = max(index, first_unstarted)
+            dropped = session.passages[start:]
+            del session.passages[start:]
+            session.exhausted = False
+            session.cond.notify_all()
+        for passage in dropped:
+            self._remove_passage_audio(passage)
+        return [p.passage_id for p in dropped]
+
+    def shutdown(self) -> None:
+        with self._lock:
+            session = self._session
+        if session is not None:
+            self._end_session(session, "", emit=False)
+        with self._piper_server_lock:
+            server = self._piper_server
+            self._piper_server = None
+        if server is not None:
+            server.close()
+
+    def _resolve_speech_settings(self, language_override: str | None) -> dict[str, Any]:
+        # A voice for the language, else a system voice rather than reading
+        # Hebrew through an English model.
+        engine = str(self.config.get("engine", "spd-say")).strip() or "spd-say"
+        language = str(language_override or self.config.get("language", "en")).strip()
+        piper_model = str(self.config.get("piper_model", "")).strip()
+        selected_model = ""
+        if engine == "piper":
+            if piper_model and piper_model_matches_language(piper_model, language):
+                selected_model = piper_model
+            else:
+                selected_model = choose_piper_model_for_language(list_piper_model_paths(), language)
+            if not selected_model:
+                for fallback_engine in ("espeak-ng", "espeak", "spd-say"):
+                    if shutil.which(fallback_engine):
+                        log_line(f"tts: no Piper voice for language={language!r}; falling back to {fallback_engine}")
+                        engine = fallback_engine
+                        break
+        rate = int(self.config.get("rate", 0))
+        return {
+            "engine": engine,
+            "model": selected_model,
+            "binary": resolve_piper_binary(self.config) if engine == "piper" else "",
+            "rate": rate,
+            "pitch": int(self.config.get("pitch", 0)),
+            "language": language,
+            "speech_language": normalize_language_family(language),
+            "voice": str(self.config.get("voice", "")).strip(),
+            "voice_type": str(self.config.get("voice_type", "male1")).strip(),
+            "output_module": str(self.config.get("output_module", "")).strip(),
+            "device": str(self.config.get("audio_output_device", "")).strip(),
+            # lower length_scale => faster; keep range conservative for intelligibility
+            "length_scale": max(0.60, min(1.60, 1.00 - (rate / 220.0))),
+        }
+
+    def _emit_passage(self, passage_id: int, word_index: int, word_total: int) -> None:
+        if self.on_passage is not None:
+            self.on_passage(passage_id, word_index, word_total)
+
+    def _emit_need_text(self) -> None:
+        if self.on_need_text is not None:
+            self.on_need_text()
+
+    def _remove_passage_audio(self, passage: SpeechPassage) -> None:
+        if passage.wav_path:
+            try:
+                os.unlink(passage.wav_path)
+            except Exception:
+                pass
+            passage.wav_path = ""
+
+    def _pause_session(self, session: ReadingSession) -> tuple[bool, str]:
+        with session.cond:
+            if session.cancelled:
+                return False, "Not reading"
+            if session.paused:
+                return False, "Already paused"
+            session.paused = True
+            player = session.player
+            live_engine = session.settings["engine"] == "spd-say"
+            if player is not None and live_engine:
+                session.replay_current = True
+        if player is not None:
+            if live_engine:
+                # speech-dispatcher cannot be frozen; the passage is spoken
+                # again from its start on resume.
+                self._stop_speech_dispatcher()
+                self._terminate_process(player)
+            else:
+                self._signal_process_group(player, signal.SIGSTOP)
+        with self._lock:
+            if self._session is session:
+                self._speaking = False
+                self._paused = True
+        self._emit_state(False, "paused")
+        return True, "Paused"
+
+    def _resume_session(self, session: ReadingSession) -> tuple[bool, str]:
+        with session.cond:
+            if session.cancelled or not session.paused:
+                return False, "Not paused"
+            session.paused = False
+            player = session.player
+            session.cond.notify_all()
+        if player is not None and player.poll() is None:
+            self._signal_process_group(player, signal.SIGCONT)
+        with self._lock:
+            if self._session is session:
+                self._speaking = True
+                self._paused = False
+        self._emit_state(True, "reading")
+        return True, "Resumed"
+
+    def _signal_process_group(self, proc: subprocess.Popen[str], sig: int) -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except Exception:
+            try:
+                proc.send_signal(sig)
+            except Exception:
+                pass
+
+    def _stop_speech_dispatcher(self) -> None:
+        try:
+            if shutil.which("spd-say"):
+                subprocess.run(["spd-say", "-S"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def _end_session(self, session: ReadingSession, reason: str, emit: bool = True) -> None:
+        with session.cond:
+            already = session.cancelled
+            session.cancelled = True
+            player = session.player
+            passages = list(session.passages)
+            session.cond.notify_all()
+        if player is not None:
+            # A frozen (paused) player only acts on SIGTERM once continued.
+            self._signal_process_group(player, signal.SIGCONT)
+            self._terminate_process(player)
+        if session.settings["engine"] == "spd-say":
+            self._stop_speech_dispatcher()
+        with self._lock:
+            if self._session is session:
+                self._session = None
+                self._speaking = False
+                self._paused = False
+                self._run_id += 1
+        for passage in passages:
+            self._remove_passage_audio(passage)
+        if emit and reason and not already:
+            self._emit_state(False, reason)
+
+    def _session_play_loop(self, session: ReadingSession) -> None:
+        engine = session.settings["engine"]
+        caught_up_since: float | None = None
+        played_any = False
+        failures_in_row = 0
+        while True:
+            passage: SpeechPassage | None = None
+            finished = False
+            with session.cond:
+                while True:
+                    if session.cancelled:
+                        return
+                    if not session.paused:
+                        if session.play_index < len(session.passages):
+                            caught_up_since = None
+                            candidate = session.passages[session.play_index]
+                            if engine != "piper" or candidate.state != "pending":
+                                passage = candidate
+                                break
+                        elif session.exhausted:
+                            # Give the GUI a moment in case text is arriving.
+                            if caught_up_since is None:
+                                caught_up_since = time.monotonic()
+                            elif time.monotonic() - caught_up_since > 0.35:
+                                finished = True
+                                break
+                        else:
+                            caught_up_since = None
+                    session.cond.wait(0.1)
+                if passage is not None:
+                    session.playing_id = passage.passage_id
+            if finished:
+                self._end_session(session, "done")
+                return
+            assert passage is not None
+            self._emit_need_text()
+            ok = self._play_passage(session, passage)
+            with session.cond:
+                if session.cancelled:
+                    return
+                session.playing_id = None
+                if session.replay_current:
+                    session.replay_current = False
+                    continue
+                if session.play_index < len(session.passages) and session.passages[session.play_index] is passage:
+                    session.play_index += 1
+                session.cond.notify_all()
+            self._remove_passage_audio(passage)
+            if not ok:
+                detail = passage.error or "TTS failed"
+                log_line(f"session {session.session_id} passage {passage.passage_id} failed: {detail!r}")
+                failures_in_row += 1
+                # One odd passage should not stop a long read; a broken engine
+                # fails from the start or keeps failing.
+                if not played_any or failures_in_row >= 3:
+                    notify("Voice Reading", detail, urgency="critical")
+                    self._end_session(session, "error")
+                    return
+            else:
+                played_any = True
+                failures_in_row = 0
+            self._emit_need_text()
+
+    def _play_passage(self, session: ReadingSession, passage: SpeechPassage) -> bool:
+        settings = session.settings
+        engine = settings["engine"]
+        device = settings["device"]
+        self._emit_passage(passage.passage_id, 0, len(passage.words))
+        if not passage.speak_text.strip():
+            return True
+
+        if engine == "piper":
+            if passage.state != "ready":
+                return False
+            if not passage.wav_path:
+                return True  # nothing speakable (e.g. punctuation only)
+            player_cmds = list_audio_player_commands(passage.wav_path, device)
+            if not player_cmds:
+                passage.error = "No audio player found (pw-play/aplay/paplay/ffplay/mpv)"
+                return False
+            self._start_passage_tracker(session, passage, passage.duration)
+            last_error = ""
+            for player_cmd in player_cmds:
+                ok, last_error = self._run_session_process(
+                    session,
+                    player_cmd,
+                    env=audio_output_env(device),
+                )
+                if ok or session.cancelled:
+                    return True
+            passage.error = last_error or "Audio player failed"
+            return False
+
+        wpm = self._estimate_words_per_minute(engine, settings["rate"], piper_length_scale=1.0)
+        estimated = max(0.3, len(passage.words) * (60.0 / max(60.0, wpm)))
+        if engine in {"espeak-ng", "espeak"} and shutil.which(engine):
+            wpm_arg = max(90, min(420, 175 + (settings["rate"] * 2)))
+            cmd = [engine, "-s", str(wpm_arg), "-p", str(max(0, min(99, 50 + settings["pitch"] // 2))), "--stdin"]
+            if settings["voice"]:
+                cmd.extend(["-v", settings["voice"]])
+            elif settings["speech_language"]:
+                cmd.extend(["-v", settings["speech_language"]])
+            self._start_passage_tracker(session, passage, estimated)
+            ok, error = self._run_session_process(
+                session, cmd, env=audio_output_env(device), input_text=passage.speak_text
+            )
+            passage.error = error
+            return ok or session.cancelled
+        if engine == "spd-say" and shutil.which("spd-say"):
+            cmd = ["spd-say", "-w", "-r", str(settings["rate"]), "-p", str(settings["pitch"]), "-N", "voice-reading", "-n", "main"]
+            if settings["output_module"]:
+                cmd.extend(["-o", settings["output_module"]])
+            if settings["speech_language"]:
+                cmd.extend(["-l", settings["speech_language"]])
+            if settings["voice_type"]:
+                cmd.extend(["-t", settings["voice_type"]])
+            if settings["voice"]:
+                cmd.extend(["-y", settings["voice"]])
+            cmd.append(passage.speak_text)
+            if device:
+                threading.Thread(target=route_speech_to_output_device, args=(device,), daemon=True).start()
+            self._start_passage_tracker(session, passage, estimated)
+            ok, error = self._run_session_process(session, cmd)
+            passage.error = error
+            return ok or session.cancelled or session.replay_current
+        passage.error = f"TTS engine not available: {engine}"
+        return False
+
+    def _run_session_process(
+        self,
+        session: ReadingSession,
+        cmd: list[str],
+        env: dict[str, str] | None = None,
+        input_text: str | None = None,
+    ) -> tuple[bool, str]:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE if input_text is not None else None,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                text=True,
+                env=env,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        with session.cond:
+            if session.cancelled:
+                self._terminate_process(proc)
+                return True, ""
+            session.player = proc
+            paused = session.paused
+        if paused:
+            self._signal_process_group(proc, signal.SIGSTOP)
+        try:
+            _, stderr_text = proc.communicate(input=input_text, timeout=None)
+        except Exception as exc:
+            stderr_text = str(exc)
+        with session.cond:
+            if session.player is proc:
+                session.player = None
+        if proc.returncode == 0:
+            return True, ""
+        return False, (stderr_text or "").strip() or f"{cmd[0]} failed"
+
+    def _start_passage_tracker(self, session: ReadingSession, passage: SpeechPassage, duration: float) -> None:
+        if not passage.words:
+            return
+        exact = passage.word_times is not None and len(passage.word_times) == len(passage.words)
+        if exact:
+            offsets = [start for start, _end in passage.word_times or []]
+        else:
+            offsets = self._estimate_word_offsets(passage.words, max(0.05, duration))
+        try:
+            # Time from starting the player to hearing its first sample.
+            delay = float(self.config.get("highlight_delay_seconds", 0.06))
+        except (TypeError, ValueError):
+            delay = 0.06
+        poll = 0.02 if exact else 0.08
+
+        def _run() -> None:
+            played = -delay
+            last_tick = time.monotonic()
+            last_index = 0
+            while True:
+                time.sleep(poll)
+                with session.cond:
+                    if session.cancelled or session.playing_id != passage.passage_id:
+                        return
+                    paused = session.paused
+                now = time.monotonic()
+                if not paused:
+                    played += now - last_tick
+                last_tick = now
+                index = max(0, min(len(offsets) - 1, bisect.bisect_right(offsets, played) - 1))
+                if index != last_index:
+                    last_index = index
+                    self._emit_passage(passage.passage_id, index, len(passage.words))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _session_synth_loop(self, session: ReadingSession) -> None:
+        while True:
+            with session.cond:
+                target: SpeechPassage | None = None
+                while target is None:
+                    if session.cancelled:
+                        return
+                    target = next(
+                        (p for p in session.passages[session.play_index :] if p.state == "pending"),
+                        None,
+                    )
+                    if target is None:
+                        session.cond.wait(0.5)
+            result = self._synthesize_passage(session, target.speak_text)
+            wav_path, duration, error = result[:3]
+            word_times = result[3] if len(result) > 3 else None
+            with session.cond:
+                still_queued = any(p is target for p in session.passages)
+                if error:
+                    target.state = "failed"
+                    target.error = error
+                else:
+                    target.state = "ready"
+                    target.wav_path = wav_path
+                    target.duration = duration
+                    target.word_times = word_times
+                session.cond.notify_all()
+                cancelled = session.cancelled
+            if cancelled or not still_queued:
+                self._remove_passage_audio(target)
+
+    def _synthesize_passage(
+        self, session: ReadingSession, text: str
+    ) -> tuple[str, float, str, list[list[float]] | None]:
+        """Returns (wav_path, duration, error, word_times); an empty wav_path
+        with no error means the passage has nothing to speak."""
+        settings = session.settings
+        binary = settings["binary"]
+        model = settings["model"]
+        if not binary:
+            return "", 0.0, "Piper engine not found", None
+        if not model:
+            return "", 0.0, "No Piper model found. Add a .onnx voice model.", None
+        prepared, error = prepare_piper_text(text, model)
+        if error:
+            return "", 0.0, error, None
+        if not prepared.strip():
+            return "", 0.0, "", None
+        with self._piper_server_lock:
+            self._passage_audio_counter += 1
+            counter = self._passage_audio_counter
+        wav_path = str(
+            Path(tempfile.gettempdir()) / f"voice_reading_{os.getpid()}_{session.session_id}_{counter}.wav"
+        )
+        error = ""
+        word_times: list[list[float]] | None = None
+        if binary not in self._piper_json_unsupported:
+            server = self._get_piper_server(binary, model, settings["length_scale"])
+            if server is not None:
+                error, word_times = server.synthesize(prepared, wav_path)
+            else:
+                error = "Piper failed to start"
+            if error == "Piper process exited":
+                # An older/other piper build without --json-input: fall back
+                # to one process per passage for this binary.
+                log_line(f"piper: {binary} has no usable --json-input mode; using one process per passage")
+                self._piper_json_unsupported.add(binary)
+        if binary in self._piper_json_unsupported:
+            error = self._synthesize_passage_once(binary, model, settings["length_scale"], prepared, wav_path)
+        duration = 0.0 if error else (self._wav_duration_seconds(wav_path) or 0.0)
+        if error or duration <= 0.0:
+            try:
+                os.unlink(wav_path)
+            except Exception:
+                pass
+            return "", 0.0, error, None  # no error + no audio: nothing to pronounce
+        # Hebrew passages are spoken from their phonemized form, whose words
+        # need not line up with the displayed ones.
+        if prepared != text:
+            word_times = None
+        return wav_path, duration, "", word_times
+
+    def _synthesize_passage_once(self, binary: str, model: str, length_scale: float, text: str, wav_path: str) -> str:
+        try:
+            result = subprocess.run(
+                [binary, "--model", model, "--output_file", wav_path, "--length_scale", f"{length_scale:.3f}", "--quiet"],
+                input=text,
+                text=True,
+                capture_output=True,
+                timeout=180,
+                check=False,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            return f"Piper failed: {exc}"
+        if result.returncode != 0 or not os.path.exists(wav_path):
+            return (result.stderr or "").strip()[-400:] or "Piper failed"
+        return ""
+
+    def _get_piper_server(self, binary: str, model: str, length_scale: float) -> PiperSynthServer | None:
+        key = (binary, model, round(length_scale, 3))
+        with self._piper_server_lock:
+            server = self._piper_server
+            if server is not None and (server.key != key or not server.alive()):
+                server.close()
+                server = None
+                self._piper_server = None
+            if server is None:
+                try:
+                    server = PiperSynthServer(binary, model, length_scale)
+                except Exception as exc:
+                    log_line(f"piper: could not start {binary}: {exc}")
+                    return None
+                self._piper_server = server
+                if not self._piper_reaper_started:
+                    self._piper_reaper_started = True
+                    threading.Thread(target=self._piper_reaper_loop, daemon=True).start()
+            return server
+
+    def _piper_reaper_loop(self) -> None:
+        # A warm voice holds (V)RAM; release it once reading has been idle a while.
+        while True:
+            time.sleep(15)
+            try:
+                keep_warm = float(self.config.get("piper_keep_warm_seconds", PIPER_KEEP_WARM_SECONDS_DEFAULT))
+            except (TypeError, ValueError):
+                keep_warm = PIPER_KEEP_WARM_SECONDS_DEFAULT
+            with self._lock:
+                busy = self._session is not None
+            with self._piper_server_lock:
+                server = self._piper_server
+                if server is None or busy or time.monotonic() - server.last_used < keep_warm:
+                    continue
+                self._piper_server = None
+            server.close()
+            log_line("piper: released idle voice")
 
 
 class IpcServer(threading.Thread):
@@ -1904,6 +2318,7 @@ class IpcServer(threading.Thread):
         self.on_show = on_show
         self._socket: socket.socket | None = None
         self._stop_event = threading.Event()
+        self._bound_inode: int | None = None
         self._last_toggle = 0.0
 
     def stop(self) -> None:
@@ -1913,8 +2328,11 @@ class IpcServer(threading.Thread):
                 self._socket.close()
             except Exception:
                 pass
+        # Only remove the socket file this server created: another instance
+        # may have bound the path since, and deleting it would cut that
+        # instance off from every hotkey.
         try:
-            if os.path.exists(SOCKET_PATH):
+            if self._bound_inode is not None and os.stat(SOCKET_PATH).st_ino == self._bound_inode:
                 os.unlink(SOCKET_PATH)
         except Exception:
             pass
@@ -1926,6 +2344,7 @@ class IpcServer(threading.Thread):
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             server.bind(SOCKET_PATH)
             os.chmod(SOCKET_PATH, 0o600)
+            self._bound_inode = os.stat(SOCKET_PATH).st_ino
             server.listen(8)
             server.settimeout(0.4)
             self._socket = server
@@ -2018,1015 +2437,6 @@ class IpcServer(threading.Thread):
             }
 
         return {"ok": False, "error": f"unknown command: {cmd}"}
-
-
-class VoiceReadingGui:
-    def __init__(self, read_on_launch: bool, translate_on_launch: bool = False) -> None:
-        self.config = ConfigManager(CONFIG_PATH)
-        self.events: "queue.Queue[tuple[str, Any, Any]]" = queue.Queue()
-
-        self.root = tk.Tk()
-        self.root.title(APP_NAME)
-        self.root.geometry("760x560")
-        self.root.minsize(340, 180)
-        self.root.configure(bg="#0f1115")
-        self.root.withdraw()
-        self.root.resizable(True, True)
-        try:
-            self.root.wm_focusmodel("passive")
-        except Exception:
-            pass
-        self._configure_style()
-
-        self.status_var = tk.StringVar(value="Idle")
-        self.source_var = tk.StringVar(value="Source: none")
-        self.translation_status_var = tk.StringVar(value="Translation is text-only and uses local Gemma/Ollama")
-        self.translation_target_var = tk.StringVar(
-            value=str(self.config.get("translation_target_language", "English"))
-        )
-        self.translation_speak_var = tk.BooleanVar(
-            value=bool(self.config.get("translation_speak_aloud", False))
-        )
-        self.ollama_model_var = tk.StringVar(
-            value=str(self.config.get("ollama_model", "gemma4:latest"))
-        )
-        configured_context = str(self.config.get("ollama_context_tokens", 2048)).strip()
-        self.ollama_context_var = tk.StringVar(
-            value=configured_context if configured_context in {"1024", "2048", "4096", "8192", "16384"} else "2048"
-        )
-        self._ollama_models: list[str] = []
-        self.pause_btn_var = tk.StringVar(value="Pause")
-        self.rate_var = tk.IntVar(value=int(self.config.get("rate", 0)))
-        self.pitch_var = tk.IntVar(value=int(self.config.get("pitch", 0)))
-        configured_language = str(self.config.get("language", "en")).strip().lower()
-        self.lang_var = tk.StringVar(value=configured_language if configured_language in {"en", "fr", "it", "he"} else "en")
-        self.voice_var = tk.StringVar(value=str(self.config.get("voice", "")))
-        self.voice_type_var = tk.StringVar(value=str(self.config.get("voice_type", "male1")))
-        self.output_module_var = tk.StringVar(value=str(self.config.get("output_module", "")))
-        self.piper_gpu_var = tk.BooleanVar(value=bool(self.config.get("piper_gpu_enabled", False)))
-        self.piper_gpu_path_var = tk.StringVar(value=str(self.config.get("piper_gpu_binary_path", "")))
-        self._piper_model_map: dict[str, str] = {}
-        available = detect_engines(self.config)
-        preferred = str(self.config.get("engine", "spd-say"))
-        self.engine_var = tk.StringVar(value=preferred if preferred in available else (available[0] if available else "spd-say"))
-
-        self.prefer_primary_var = tk.BooleanVar(value=bool(self.config.get("prefer_primary_selection", True)))
-        self.copy_fallback_var = tk.BooleanVar(value=bool(self.config.get("capture_selected_text_via_copy", True)))
-        self.show_hotkey_var = tk.BooleanVar(value=bool(self.config.get("show_panel_on_hotkey", True)))
-        self.always_on_top_var = tk.BooleanVar(value=bool(self.config.get("window_always_on_top", False)))
-        self.ultra_precise_sync_var = tk.BooleanVar(value=bool(self.config.get("ultra_precise_highlight_sync", False)))
-        selected_mode = resolve_preprocess_mode(self.config)
-        self.preprocess_mode_var = tk.StringVar(value=PREPROCESS_MODE_LABELS.get(selected_mode, PREPROCESS_MODE_LABELS[PREPROCESS_MODE_OFF]))
-        legacy_strict_sentence = bool(self.config.get("strict_sentence_highlight", True))
-        self.highlight_words_var = tk.BooleanVar(
-            value=bool(self.config.get("highlight_words_enabled", not legacy_strict_sentence))
-        )
-        self.highlight_sentences_var = tk.BooleanVar(
-            value=bool(self.config.get("highlight_sentences_enabled", legacy_strict_sentence))
-        )
-        self._is_paused = False
-        self._word_spans: list[tuple[int, int]] = []
-        self._sentence_spans: list[tuple[int, int]] = []
-        self._word_to_sentence: list[int] = []
-        self._last_highlighted_word: Any = None
-        self._reading_panel_collapsed = False
-
-        self.controller = ReaderController(
-            config=self.config,
-            on_state_change=lambda speaking, reason: self.events.put(("state", speaking, reason)),
-            on_text=lambda text, source: self.events.put(("text", text, source)),
-            on_progress=lambda idx, total: self.events.put(("progress", idx, total)),
-            on_translation=lambda text, target, meta: self.events.put(("translation", text, (target, meta))),
-        )
-        self.ipc = IpcServer(
-            controller=self.controller,
-            config=self.config,
-            on_show=lambda active: self.events.put(("show", None, active)),
-        )
-
-        self._build_ui()
-        self._apply_window_presentation()
-        self.root.bind("<Configure>", self._on_window_resize)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        self.ipc.start()
-        self._tick()
-        if read_on_launch:
-            self.controller.read_selection_async()
-            if bool(self.config.get("show_panel_on_hotkey", True)):
-                self._show_window(active=False)
-        elif translate_on_launch:
-            target = str(self.config.get("translation_target_language", "English")).strip() or "English"
-            self.controller.translate_selection_async(target, speak_aloud=False)
-            self.translation_frame.pack(fill="both", expand=True, pady=(0, 6))
-            self._show_window(active=False)
-        else:
-            self._show_window(active=True)
-
-    def _configure_style(self) -> None:
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure(".", font=("DejaVu Sans Mono", 10))
-        style.configure("VR.Root.TFrame", background="#0f1115")
-        style.configure("VR.Card.TFrame", background="#11231c")
-        style.configure("VR.Status.TLabel", font=("DejaVu Sans Mono", 11, "bold"), foreground="#ecfdf5", background="#11231c")
-        style.configure("VR.Meta.TLabel", foreground="#34d399", background="#0f1115")
-        style.configure("VR.TButton", padding=(10, 4), background="#059669", foreground="#ecfdf5", borderwidth=0)
-        style.map("VR.TButton", background=[("pressed", "#047857"), ("active", "#10b981")])
-        style.configure("VR.TCheckbutton", background="#171a20", foreground="#cbd5e1")
-
-    def _apply_window_presentation(self) -> None:
-        try:
-            keep_on_top = bool(self.always_on_top_var.get())
-            self.root.attributes("-topmost", keep_on_top)
-        except Exception:
-            pass
-        try:
-            opacity = float(self.config.get("window_opacity", 0.95))
-            opacity = max(0.35, min(1.0, opacity))
-            self.root.attributes("-alpha", opacity)
-        except Exception:
-            pass
-
-    def _build_ui(self) -> None:
-        root = ttk.Frame(self.root, padding=10, style="VR.Root.TFrame")
-        root.pack(fill="both", expand=True)
-
-        # Plain tk widgets so the whole bar can change color with state.
-        self.status_bar = tk.Frame(root, bg="#11231c", padx=10, pady=8)
-        self.status_bar.pack(fill="x")
-        self.dot = tk.Canvas(self.status_bar, width=18, height=18, highlightthickness=0, bd=0, bg="#11231c")
-        self.dot.pack(side="left", padx=(0, 8))
-        self.dot_indicator = self.dot.create_oval(2, 2, 16, 16, fill="#475569", outline="")
-        self.status_label = tk.Label(
-            self.status_bar,
-            textvariable=self.status_var,
-            font=("DejaVu Sans Mono", 13, "bold"),
-            fg="#94a3b8",
-            bg="#11231c",
-        )
-        self.status_label.pack(side="left")
-        ttk.Button(self.status_bar, text="Read Selection", style="VR.TButton", command=self._read_from_gui).pack(side="right")
-        ttk.Button(self.status_bar, text="Translate", style="VR.TButton", command=self._translate_from_gui).pack(
-            side="right", padx=(0, 6)
-        )
-        ttk.Button(self.status_bar, text="Settings", style="VR.TButton", command=self._toggle_settings).pack(
-            side="right", padx=(0, 6)
-        )
-        self.pause_btn = ttk.Button(
-            self.status_bar,
-            textvariable=self.pause_btn_var,
-            style="VR.TButton",
-            command=self._pause_resume_from_gui,
-            state="disabled",
-        )
-        self.pause_btn.pack(side="right", padx=(0, 6))
-        ttk.Button(self.status_bar, text="Stop", style="VR.TButton", command=self._stop_from_gui).pack(side="right", padx=(0, 6))
-
-        ttk.Label(root, textvariable=self.source_var, style="VR.Meta.TLabel").pack(anchor="w", pady=(4, 6))
-
-        self.reading_frame = ttk.Frame(root, style="VR.Card.TFrame", padding=(8, 8))
-        self.reading_frame.pack(fill="both", expand=True, pady=(0, 6))
-        ttk.Label(self.reading_frame, text="Selected Text", style="VR.Meta.TLabel").pack(anchor="w")
-        self.reading_box = tk.Text(
-            self.reading_frame,
-            wrap="word",
-            height=5,
-            bg="#0b1410",
-            fg="#ecfdf5",
-            insertbackground="#ecfdf5",
-            highlightthickness=0,
-            relief="solid",
-            bd=1,
-        )
-        self.reading_box.pack(fill="both", expand=True, pady=(4, 0))
-        self.reading_box.configure(state="disabled")
-        self.reading_box.tag_configure("current_word", background="#14532d", foreground="#ecfdf5", font=("DejaVu Sans Mono", 10, "bold"))
-        self.reading_box.tag_configure("current_sentence", background="#123524", foreground="#ecfdf5")
-
-        self.translation_frame = ttk.Frame(root, style="VR.Card.TFrame", padding=(8, 8))
-        translation_header = ttk.Frame(self.translation_frame, style="VR.Card.TFrame")
-        translation_header.pack(fill="x")
-        ttk.Label(translation_header, text="Translation", style="VR.Meta.TLabel").pack(side="left")
-        ttk.Label(translation_header, text="Translate to:", style="VR.Meta.TLabel").pack(side="left", padx=(14, 4))
-        self.translation_target_combo = ttk.Combobox(
-            translation_header,
-            textvariable=self.translation_target_var,
-            values=["English", "Hebrew", "French", "Italian"],
-            state="readonly",
-            width=10,
-        )
-        self.translation_target_combo.pack(side="left")
-        ttk.Button(
-            translation_header,
-            text="Translate Text",
-            style="VR.TButton",
-            command=self._translate_from_gui,
-        ).pack(side="left", padx=(8, 0))
-        ttk.Button(
-            translation_header,
-            text="Cancel",
-            style="VR.TButton",
-            command=self._cancel_translation_from_gui,
-        ).pack(side="left", padx=(6, 0))
-        ttk.Button(
-            translation_header,
-            text="Copy Translation",
-            style="VR.TButton",
-            command=self._copy_translation,
-        ).pack(side="right")
-        ttk.Checkbutton(
-            translation_header,
-            text="Speak",
-            variable=self.translation_speak_var,
-            command=self._save_options,
-            style="VR.TCheckbutton",
-        ).pack(side="right", padx=(0, 8))
-        self.translation_box = tk.Text(
-            self.translation_frame,
-            wrap="word",
-            height=5,
-            bg="#0b1410",
-            fg="#ecfdf5",
-            insertbackground="#ecfdf5",
-            highlightthickness=0,
-            relief="solid",
-            bd=1,
-        )
-        self.translation_box.pack(fill="both", expand=True, pady=(4, 0))
-        self.translation_box.configure(state="disabled")
-        ttk.Label(
-            self.translation_frame,
-            textvariable=self.translation_status_var,
-            style="VR.Meta.TLabel",
-        ).pack(anchor="w", pady=(4, 0))
-        self.translation_frame.pack_forget()
-
-        self.settings_visible = False
-        self.controls = ttk.Frame(root, style="VR.Card.TFrame", padding=(8, 8))
-        self.controls.pack(fill="x", expand=False)
-
-        row1 = ttk.Frame(self.controls, style="VR.Card.TFrame")
-        row1.pack(fill="x", pady=(2, 2))
-        ttk.Label(row1, text="Engine:", style="VR.Meta.TLabel").pack(side="left")
-        engine_combo = ttk.Combobox(row1, textvariable=self.engine_var, state="readonly")
-        engine_combo["values"] = detect_engines(self.config) or ["spd-say", "espeak-ng", "espeak"]
-        engine_combo.pack(side="left", padx=(6, 12))
-        engine_combo.bind("<<ComboboxSelected>>", self._on_engine_changed)
-        ttk.Label(row1, text="Model:", style="VR.Meta.TLabel").pack(side="left")
-        self.module_combo = ttk.Combobox(row1, textvariable=self.output_module_var, state="readonly", width=28)
-        self.module_combo.pack(side="left", padx=(6, 12))
-        self.module_combo.bind("<<ComboboxSelected>>", self._on_module_changed)
-        ttk.Label(row1, text="Voice Type:", style="VR.Meta.TLabel").pack(side="left")
-        vt_combo = ttk.Combobox(row1, textvariable=self.voice_type_var, state="readonly")
-        vt_combo["values"] = VOICE_TYPES
-        vt_combo.pack(side="left", padx=(6, 0))
-        vt_combo.bind("<<ComboboxSelected>>", self._save_options)
-
-        row2 = ttk.Frame(self.controls, style="VR.Card.TFrame")
-        row2.pack(fill="x", pady=(2, 2))
-        ttk.Label(row2, text="Language:", style="VR.Meta.TLabel").pack(side="left")
-        self.language_combo = ttk.Combobox(
-            row2,
-            textvariable=self.lang_var,
-            values=["en", "fr", "it", "he"],
-            state="readonly",
-            width=6,
-        )
-        self.language_combo.pack(side="left", padx=(6, 12))
-        self.language_combo.bind("<<ComboboxSelected>>", self._on_language_changed)
-        ttk.Label(row2, text="Voice:", style="VR.Meta.TLabel").pack(side="left")
-        self.voice_combo = ttk.Combobox(row2, textvariable=self.voice_var, width=20)
-        self.voice_combo.pack(side="left", padx=(6, 0), fill="x", expand=True)
-        self.voice_combo.bind("<<ComboboxSelected>>", self._save_options)
-
-        row2b = ttk.Frame(self.controls, style="VR.Card.TFrame")
-        row2b.pack(fill="x", pady=(2, 2))
-        ttk.Label(row2b, text="Reading Mode:", style="VR.Meta.TLabel").pack(side="left")
-        preprocess_combo = ttk.Combobox(row2b, textvariable=self.preprocess_mode_var, state="readonly", width=28)
-        preprocess_combo["values"] = [PREPROCESS_MODE_LABELS[key] for key in PREPROCESS_MODE_LABELS]
-        preprocess_combo.pack(side="left", padx=(6, 12))
-        preprocess_combo.bind("<<ComboboxSelected>>", self._save_options)
-        ttk.Label(row2b, text="Translation Model:", style="VR.Meta.TLabel").pack(side="left", padx=(6, 4))
-        self.ollama_model_combo = ttk.Combobox(
-            row2b,
-            textvariable=self.ollama_model_var,
-            values=["gemma4:latest", "gemma4:12b-it-qat"],
-            state="readonly",
-            width=20,
-        )
-        self.ollama_model_combo.pack(side="left")
-        self.ollama_model_combo.bind("<<ComboboxSelected>>", self._on_ollama_model_changed)
-
-        row2c = ttk.Frame(self.controls, style="VR.Card.TFrame")
-        row2c.pack(fill="x", pady=(2, 2))
-        ttk.Checkbutton(
-            row2c,
-            text="Use GPU Piper runtime",
-            variable=self.piper_gpu_var,
-            command=self._save_options,
-            style="VR.TCheckbutton",
-        ).pack(side="left")
-        ttk.Entry(row2c, textvariable=self.piper_gpu_path_var).pack(side="left", fill="x", expand=True, padx=(8, 0))
-
-        row2d = ttk.Frame(self.controls, style="VR.Card.TFrame")
-        row2d.pack(fill="x", pady=(2, 2))
-        ttk.Label(row2d, text="Context tokens:", style="VR.Meta.TLabel").pack(side="left")
-        context_combo = ttk.Combobox(
-            row2d,
-            textvariable=self.ollama_context_var,
-            values=["1024", "2048", "4096", "8192", "16384"],
-            state="readonly",
-            width=8,
-        )
-        context_combo.pack(side="left", padx=(6, 8))
-        context_combo.bind("<<ComboboxSelected>>", self._save_options)
-        ttk.Label(
-            row2d,
-            text="lower values use less VRAM; 2048 is a good RTX 8 GB starting point",
-            style="VR.Meta.TLabel",
-        ).pack(side="left")
-
-        row3 = ttk.Frame(self.controls, style="VR.Card.TFrame")
-        row3.pack(fill="x", pady=(2, 2))
-        ttk.Label(row3, text="Rate", style="VR.Meta.TLabel").pack(side="left")
-        tk.Scale(
-            row3,
-            variable=self.rate_var,
-            from_=-100,
-            to=100,
-            orient="horizontal",
-            showvalue=True,
-            command=lambda _v: self._save_options(),
-            bg="#171a20",
-            fg="#cbd5e1",
-            troughcolor="#0b0d10",
-            highlightthickness=0,
-        ).pack(side="left", fill="x", expand=True, padx=(8, 8))
-
-        row4 = ttk.Frame(self.controls, style="VR.Card.TFrame")
-        row4.pack(fill="x", pady=(2, 2))
-        ttk.Label(row4, text="Pitch", style="VR.Meta.TLabel").pack(side="left")
-        tk.Scale(
-            row4,
-            variable=self.pitch_var,
-            from_=-100,
-            to=100,
-            orient="horizontal",
-            showvalue=True,
-            command=lambda _v: self._save_options(),
-            bg="#171a20",
-            fg="#cbd5e1",
-            troughcolor="#0b0d10",
-            highlightthickness=0,
-        ).pack(side="left", fill="x", expand=True, padx=(8, 8))
-
-        ttk.Checkbutton(
-            self.controls,
-            text="Prefer primary selection",
-            variable=self.prefer_primary_var,
-            command=self._save_options,
-            style="VR.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-        ttk.Checkbutton(
-            self.controls,
-            text="Use copy fallback when selection is unavailable",
-            variable=self.copy_fallback_var,
-            command=self._save_options,
-            style="VR.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-        ttk.Checkbutton(
-            self.controls,
-            text="Show panel on hotkey",
-            variable=self.show_hotkey_var,
-            command=self._save_options,
-            style="VR.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-        ttk.Checkbutton(
-            self.controls,
-            text="Keep panel always on top",
-            variable=self.always_on_top_var,
-            command=self._save_options,
-            style="VR.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-        ttk.Checkbutton(
-            self.controls,
-            text="Ultra-precise highlight sync (slower start)",
-            variable=self.ultra_precise_sync_var,
-            command=self._save_options,
-            style="VR.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-        ttk.Checkbutton(
-            self.controls,
-            text="Highlight words",
-            variable=self.highlight_words_var,
-            command=self._save_options,
-            style="VR.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-        ttk.Checkbutton(
-            self.controls,
-            text="Highlight sentences",
-            variable=self.highlight_sentences_var,
-            command=self._save_options,
-            style="VR.TCheckbutton",
-        ).pack(anchor="w", pady=(2, 0))
-
-        self.footer = ttk.Frame(root, style="VR.Root.TFrame")
-        self.footer.pack(fill="x", pady=(6, 0))
-        ttk.Button(self.footer, text="Apply", style="VR.TButton", command=self._save_options).pack(side="right")
-        ttk.Button(self.footer, text="Refresh Models", style="VR.TButton", command=self._refresh_all_model_lists).pack(
-            side="right", padx=(0, 6)
-        )
-        ttk.Button(self.footer, text="Get Voices", style="VR.TButton", command=self._open_voice_downloader).pack(
-            side="right", padx=(0, 6)
-        )
-        ttk.Button(self.footer, text="Help", style="VR.TButton", command=self._show_help).pack(side="right", padx=(0, 6))
-        self.controls.pack_forget()
-        self.footer.pack_forget()
-
-        self._refresh_model_lists()
-        self._refresh_ollama_models()
-        self._apply_language_default_voice()
-
-    def _toggle_settings(self) -> None:
-        self.settings_visible = not self.settings_visible
-        if self.settings_visible:
-            self.controls.pack(fill="x", expand=False)
-            self.footer.pack(fill="x", pady=(6, 0))
-        else:
-            self.controls.pack_forget()
-            self.footer.pack_forget()
-
-    def _refresh_all_model_lists(self) -> None:
-        self._refresh_model_lists()
-        self._refresh_ollama_models()
-
-    def _show_help(self) -> None:
-        msg = (
-            "Read Aloud Hotkey Flow:\n"
-            "- Select text with mouse.\n"
-            "- Press Super+R to read.\n"
-            "- Press Super+R again to stop.\n\n"
-            "Pause/Resume is available from GUI and resumes from the current place.\n"
-            "Use Engine + Model + Voice for quality tuning.\n"
-            "Translate sends the selected text to local Ollama/Gemma and returns text only.\n"
-            "Use Cancel to stop a running translation; starting another translation cancels the previous one.\n"
-            "Supported targets: English, Hebrew, French, Italian.\n"
-            "Piper voice defaults follow the selected language; Hebrew uses the Phonikud voice when installed, with speech-dispatcher/espeak as fallback.\n"
-            "Math reading quality depends on selected engine/voice.\n"
-            "Reading mode options: Off, Code/Math, Codex output, Markdown raw.\n"
-            "Highlight words/sentences can be toggled independently."
-        )
-        messagebox.showinfo("Voice Reading Help", msg)
-
-    def _refresh_model_lists(self) -> None:
-        if self.engine_var.get().strip() == "spd-say":
-            modules = list_spd_output_modules()
-            if not modules:
-                modules = [""]
-            self.module_combo.configure(state="readonly")
-            self.module_combo["values"] = modules
-            self.voice_combo.configure(state="normal")
-            current_module = self.output_module_var.get().strip()
-            if current_module and current_module in modules:
-                self.output_module_var.set(current_module)
-            else:
-                preferred = "rhvoice" if "rhvoice" in modules else modules[0]
-                self.output_module_var.set(preferred)
-
-            selected_module = self.output_module_var.get().strip()
-            if selected_module.lower() == "rhvoice":
-                voices = list_rhvoice_voices()
-                if not voices:
-                    voices = list_spd_synthesis_voices(selected_module)
-            else:
-                voices = list_spd_synthesis_voices(selected_module)
-            if not voices:
-                voices = [self.voice_var.get().strip()]
-            self.voice_combo["values"] = [v for v in voices if v]
-            current_voice = self.voice_var.get().strip()
-            if current_voice and current_voice in voices:
-                self.voice_var.set(current_voice)
-            elif selected_module.lower() == "rhvoice":
-                self.voice_var.set(pick_preferred_rhvoice_voice([v for v in voices if v]))
-            elif voices and voices[0]:
-                self.voice_var.set(voices[0])
-        elif self.engine_var.get().strip() == "piper":
-            self._piper_model_map = {}
-            model_paths = list_piper_model_paths()
-            preferred_path = choose_preferred_piper_model(model_paths)
-            labels: list[str] = []
-            for model_path in model_paths:
-                label = format_piper_model_label(model_path)
-                unique = label
-                suffix = 2
-                while unique in self._piper_model_map:
-                    unique = f"{label} #{suffix}"
-                    suffix += 1
-                self._piper_model_map[unique] = model_path
-                labels.append(unique)
-
-            self.module_combo.configure(state="readonly")
-            self.module_combo["values"] = labels or [""]
-            saved_path = str(self.config.get("piper_model", "")).strip()
-            selected_label = ""
-            if saved_path:
-                for label, path in self._piper_model_map.items():
-                    if path == saved_path:
-                        selected_label = label
-                        break
-            if not selected_label and preferred_path:
-                for label, path in self._piper_model_map.items():
-                    if path == preferred_path:
-                        selected_label = label
-                        break
-            if not selected_label and labels:
-                selected_label = labels[0]
-            self.output_module_var.set(selected_label)
-
-            self.voice_combo["values"] = []
-            self.voice_combo.configure(state="disabled")
-            self.voice_type_var.set("male1")
-        else:
-            self.output_module_var.set("")
-            self.module_combo["values"] = [""]
-            self.module_combo.configure(state="disabled")
-            # For espeak engines, leave voice editable (language voice codes).
-            self.voice_combo["values"] = []
-            self.voice_combo.configure(state="normal")
-
-        if self.engine_var.get().strip() == "piper":
-            self._apply_language_default_voice()
-
-    def _refresh_ollama_models(self) -> None:
-        configured = str(self.config.get("ollama_model", "gemma4:latest")).strip()
-        models = list_ollama_models(str(self.config.get("ollama_url", "http://127.0.0.1:11434")))
-        if configured and configured not in models:
-            models.insert(0, configured)
-        if not models:
-            models = [configured or "gemma4:latest", "gemma4:12b-it-qat"]
-        self._ollama_models = list(dict.fromkeys(models))
-        self.ollama_model_combo["values"] = self._ollama_models
-        if configured in self._ollama_models:
-            self.ollama_model_var.set(configured)
-        elif self._ollama_models:
-            self.ollama_model_var.set(self._ollama_models[0])
-        self._save_options()
-
-    def _on_ollama_model_changed(self, _event: Any = None) -> None:
-        self.config.set("ollama_model", self.ollama_model_var.get().strip() or "gemma4:latest")
-        try:
-            context_tokens = max(512, min(262144, int(self.ollama_context_var.get().strip())))
-        except (TypeError, ValueError):
-            context_tokens = 2048
-        self.config.set("ollama_context_tokens", context_tokens)
-        self.translation_status_var.set(f"Translation model: {self.ollama_model_var.get().strip()}")
-
-    def _on_engine_changed(self, _event: Any = None) -> None:
-        self._refresh_model_lists()
-        self._save_options()
-
-    def _on_language_changed(self, _event: Any = None) -> None:
-        self._apply_language_default_voice()
-        self._save_options()
-
-    def _apply_language_default_voice(self) -> None:
-        if self.engine_var.get().strip() != "piper":
-            return
-        selected_path = choose_piper_model_for_language(
-            list_piper_model_paths(), self.lang_var.get().strip()
-        )
-        if not selected_path:
-            return
-        for label, path in self._piper_model_map.items():
-            if path == selected_path:
-                self.output_module_var.set(label)
-                self.config.set("piper_model", selected_path)
-                return
-
-    def _on_module_changed(self, _event: Any = None) -> None:
-        engine = self.engine_var.get().strip()
-        if engine == "spd-say":
-            selected_module = self.output_module_var.get().strip()
-            if selected_module.lower() == "rhvoice":
-                voices = list_rhvoice_voices()
-                if not voices:
-                    voices = list_spd_synthesis_voices(selected_module)
-            else:
-                voices = list_spd_synthesis_voices(selected_module)
-            if voices:
-                self.voice_combo["values"] = voices
-                if self.voice_var.get().strip() not in voices:
-                    if selected_module.lower() == "rhvoice":
-                        self.voice_var.set(pick_preferred_rhvoice_voice(voices))
-                    else:
-                        self.voice_var.set(voices[0])
-        elif engine == "piper":
-            self.config.set("piper_model", self._piper_model_map.get(self.output_module_var.get().strip(), ""))
-        self._save_options()
-
-    def _save_options(self, _event: Any = None) -> None:
-        engine = self.engine_var.get().strip()
-        self.config.set("engine", engine)
-        if engine == "piper":
-            model_path = self._piper_model_map.get(self.output_module_var.get().strip(), "")
-            self.config.set("piper_model", model_path)
-            self.config.set("output_module", "")
-        else:
-            self.config.set("output_module", self.output_module_var.get().strip())
-        self.config.set("rate", int(self.rate_var.get()))
-        self.config.set("pitch", int(self.pitch_var.get()))
-        self.config.set("language", self.lang_var.get().strip())
-        self.config.set("voice", self.voice_var.get().strip())
-        self.config.set("voice_type", self.voice_type_var.get().strip())
-        self.config.set("piper_gpu_enabled", bool(self.piper_gpu_var.get()))
-        self.config.set("piper_gpu_binary_path", self.piper_gpu_path_var.get().strip())
-        self.config.set("prefer_primary_selection", bool(self.prefer_primary_var.get()))
-        self.config.set("capture_selected_text_via_copy", bool(self.copy_fallback_var.get()))
-        self.config.set("show_panel_on_hotkey", bool(self.show_hotkey_var.get()))
-        self.config.set("window_always_on_top", bool(self.always_on_top_var.get()))
-        self.config.set("translation_target_language", self.translation_target_var.get().strip() or "English")
-        self.config.set("translation_speak_aloud", bool(self.translation_speak_var.get()))
-        self.config.set("ollama_model", self.ollama_model_var.get().strip() or "gemma4:latest")
-        try:
-            context_tokens = max(512, min(262144, int(self.ollama_context_var.get().strip())))
-        except (TypeError, ValueError):
-            context_tokens = 2048
-        self.config.set("ollama_context_tokens", context_tokens)
-        self.config.set("ultra_precise_highlight_sync", bool(self.ultra_precise_sync_var.get()))
-        mode_label = self.preprocess_mode_var.get().strip()
-        mode_key = PREPROCESS_MODE_LABEL_TO_KEY.get(mode_label, PREPROCESS_MODE_OFF)
-        self.config.set("reading_preprocess_mode", mode_key)
-        # Legacy compatibility for older builds/scripts.
-        self.config.set("code_math_reading_mode", mode_key == PREPROCESS_MODE_CODE_MATH)
-        self.config.set("highlight_words_enabled", bool(self.highlight_words_var.get()))
-        self.config.set("highlight_sentences_enabled", bool(self.highlight_sentences_var.get()))
-        self._apply_window_presentation()
-        if not bool(self.highlight_words_var.get()) and not bool(self.highlight_sentences_var.get()):
-            self.reading_box.configure(state="normal")
-            self.reading_box.tag_remove("current_word", "1.0", "end")
-            self.reading_box.tag_remove("current_sentence", "1.0", "end")
-            self.reading_box.configure(state="disabled")
-            self._last_highlighted_word = None
-
-    def _read_from_gui(self) -> None:
-        ok, message = self.controller.read_selection_async()
-        if not ok:
-            self.status_var.set(message)
-            notify("Voice Reading", message, urgency="critical")
-
-    def _translate_from_gui(self) -> None:
-        target = self.translation_target_var.get().strip()
-        self.config.set("translation_target_language", target)
-        self.config.set("translation_speak_aloud", bool(self.translation_speak_var.get()))
-        self.config.set("ollama_model", self.ollama_model_var.get().strip() or "gemma4:latest")
-        ok, message = self.controller.translate_selection_async(
-            target,
-            speak_aloud=bool(self.translation_speak_var.get()),
-        )
-        self.translation_status_var.set(message)
-        if ok:
-            self.translation_frame.pack(fill="both", expand=True, pady=(0, 6))
-            self.status_var.set("Translating…")
-        else:
-            notify("Voice Reading", message, urgency="critical")
-
-    def _copy_translation(self) -> None:
-        self.translation_box.configure(state="normal")
-        text = self.translation_box.get("1.0", "end").strip()
-        self.translation_box.configure(state="disabled")
-        if text and write_clipboard(text):
-            self.translation_status_var.set("Translation copied to clipboard")
-            notify("Voice Reading", "Translation copied to clipboard")
-        elif not text:
-            self.translation_status_var.set("No translation available")
-
-    def _cancel_translation_from_gui(self) -> None:
-        ok, message = self.controller.cancel_translation()
-        self.translation_status_var.set(message)
-        if ok:
-            self.status_var.set("Translation cancelled")
-
-    def _pause_resume_from_gui(self) -> None:
-        ok, message = self.controller.pause_or_resume()
-        if not ok:
-            self.status_var.set(message)
-
-    def _stop_from_gui(self) -> None:
-        ok, message = self.controller.stop()
-        if not ok:
-            self.status_var.set(message)
-
-    def _set_visual_state(self, state: str) -> None:
-        palettes = {
-            "idle": {"bar": "#11231c", "fg": "#94a3b8", "dot": "#475569", "title": APP_NAME},
-            "reading": {"bar": "#14532d", "fg": "#dcfce7", "dot": "#4ade80", "title": f"▶ READING — {APP_NAME}"},
-            "paused": {"bar": "#78350f", "fg": "#ffedd5", "dot": "#fbbf24", "title": f"‖ Paused — {APP_NAME}"},
-            "error": {"bar": "#7f1d1d", "fg": "#fee2e2", "dot": "#f87171", "title": f"Error — {APP_NAME}"},
-        }
-        palette = palettes.get(state, palettes["idle"])
-        self.status_bar.configure(bg=palette["bar"])
-        self.dot.configure(bg=palette["bar"])
-        self.dot.itemconfig(self.dot_indicator, fill=palette["dot"])
-        self.status_label.configure(bg=palette["bar"], fg=palette["fg"])
-        try:
-            self.root.title(palette["title"])
-        except Exception:
-            pass
-
-    def _open_voice_downloader(self) -> None:
-        catalog = list_voice_catalog()
-        if not catalog:
-            messagebox.showerror(APP_NAME, "Bundled voice index not found (piper_voices/index/voices.json).")
-            return
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Download Piper Voices")
-        dialog.configure(bg="#0f1115", padx=12, pady=12)
-        dialog.transient(self.root)
-
-        tk.Label(
-            dialog,
-            text=(
-                "Piper voices — downloaded from Hugging Face into piper_voices/. "
-                "Rows show speaker, language/locale, quality, and size. "
-                "The Hebrew Phonikud row also downloads its phonemizer model."
-            ),
-            font=("DejaVu Sans Mono", 9),
-            fg="#94a3b8",
-            bg="#0f1115",
-            anchor="w",
-        ).pack(fill="x", pady=(0, 8))
-
-        listbox = tk.Listbox(
-            dialog,
-            height=min(18, len(catalog)),
-            width=112,
-            bg="#0b1410",
-            fg="#ecfdf5",
-            selectbackground="#14532d",
-            font=("DejaVu Sans Mono", 10),
-            activestyle="none",
-        )
-        for item in catalog:
-            mark = "  [installed]" if item["installed"] else ""
-            if item["is_default"]:
-                mark += "  [recommended default]"
-            language_label = f"{item['language_name']} [{item['language']}]"
-            native = f" / {item['language_native']}" if item["language_native"] else ""
-            speakers = f"speaker={item['speaker']}"
-            if item["num_speakers"] != 1:
-                speakers += f" ({item['num_speakers']} speakers)"
-            listbox.insert(
-                "end",
-                f"{item['key']:<34} {language_label}{native:<26} {speakers:<24} "
-                f"quality={item['quality']:<6} size={item['size_mb']} MB{mark}",
-            )
-        listbox.pack(fill="both", expand=True)
-
-        progress_var = tk.StringVar(value="")
-        tk.Label(
-            dialog,
-            textvariable=progress_var,
-            font=("DejaVu Sans Mono", 9),
-            fg="#34d399",
-            bg="#0f1115",
-            anchor="w",
-        ).pack(fill="x", pady=(8, 4))
-
-        def _download_selected() -> None:
-            selection = listbox.curselection()
-            if not selection:
-                progress_var.set("Select a voice first.")
-                return
-            entry = catalog[selection[0]]
-            if entry["installed"]:
-                progress_var.set(f"{entry['key']} is already installed.")
-                return
-            download_btn.configure(state="disabled")
-            progress_var.set(f"Starting download of {entry['key']}...")
-
-            def _work() -> None:
-                ok, message = download_piper_voice(
-                    entry["key"],
-                    progress=lambda msg: self.events.put(("voice_download", msg, None)),
-                )
-                self.events.put(("voice_download", message, "done" if ok else "error"))
-
-            def _poll() -> None:
-                # Route download progress into this dialog while it is open.
-                drained = []
-                try:
-                    while True:
-                        item = self.events.get_nowait()
-                        if item[0] == "voice_download":
-                            progress_var.set(str(item[1]))
-                            if item[2] == "done":
-                                download_btn.configure(state="normal")
-                                self._refresh_model_lists()
-                                return
-                            if item[2] == "error":
-                                download_btn.configure(state="normal")
-                                return
-                        else:
-                            drained.append(item)
-                except queue.Empty:
-                    pass
-                finally:
-                    for item in drained:
-                        self.events.put(item)
-                if dialog.winfo_exists():
-                    dialog.after(200, _poll)
-
-            threading.Thread(target=_work, daemon=True).start()
-            _poll()
-
-        button_row = tk.Frame(dialog, bg="#0f1115")
-        button_row.pack(fill="x")
-        download_btn = ttk.Button(button_row, text="Download Selected", style="VR.TButton", command=_download_selected)
-        download_btn.pack(side="left")
-        ttk.Button(button_row, text="Close", style="VR.TButton", command=dialog.destroy).pack(side="right")
-
-    def _tick(self) -> None:
-        self._drain_events()
-        self.root.after(200, self._tick)
-
-    def _drain_events(self) -> None:
-        while True:
-            try:
-                event, data, meta = self.events.get_nowait()
-            except queue.Empty:
-                return
-
-            if event == "state":
-                speaking = bool(data)
-                reason = str(meta)
-                if speaking:
-                    self.status_var.set("▶ READING")
-                    self._set_visual_state("reading")
-                    self._is_paused = False
-                    self.pause_btn_var.set("Pause")
-                    self.pause_btn.configure(state="normal")
-                else:
-                    status = {
-                        "done": "Ready",
-                        "stopped": "Stopped",
-                        "paused": "‖ PAUSED",
-                        "error": "Error",
-                    }.get(reason, "Idle")
-                    self.status_var.set(status)
-                    if reason == "paused":
-                        self._set_visual_state("paused")
-                        self._is_paused = True
-                        self.pause_btn_var.set("Resume")
-                        self.pause_btn.configure(state="normal")
-                    else:
-                        self._set_visual_state("error" if reason == "error" else "idle")
-                        self._is_paused = False
-                        self.pause_btn_var.set("Pause")
-                        self.pause_btn.configure(state="disabled")
-                self._apply_window_presentation()
-
-            if event == "text":
-                text = str(data).strip()
-                source = str(meta)
-                preview = text.replace("\n", " ")
-                if len(preview) > 72:
-                    preview = preview[:72] + "..."
-                self.source_var.set(f"Source: {source} | {preview}")
-                self._set_reading_text(text)
-                self._highlight_progress(0)
-
-            if event == "translation":
-                text = str(data).strip()
-                target, meta = meta if isinstance(meta, tuple) else ("", "")
-                if text:
-                    self.translation_box.configure(state="normal")
-                    self.translation_box.delete("1.0", "end")
-                    self.translation_box.insert("1.0", text)
-                    self.translation_box.configure(state="disabled")
-                    self.translation_frame.pack(fill="both", expand=True, pady=(0, 6))
-                    self.translation_status_var.set(f"Translated to {target} ({meta})")
-                    self.status_var.set("Translation ready")
-                else:
-                    message = str(meta)
-                    self.translation_status_var.set(message)
-                    self.status_var.set("Translation cancelled" if "cancel" in message.lower() else "Translation failed")
-
-            if event == "progress":
-                try:
-                    idx = int(data)
-                    total = int(meta)
-                except Exception:
-                    idx = 0
-                    total = 0
-                if total > 0:
-                    self._highlight_progress(idx)
-
-            if event == "show":
-                self._show_window(active=bool(meta) if meta is not None else True)
-
-    def _set_reading_text(self, text: str) -> None:
-        self.reading_box.configure(state="normal")
-        self.reading_box.delete("1.0", "end")
-        self.reading_box.insert("1.0", text)
-        self.reading_box.tag_remove("current_word", "1.0", "end")
-        self.reading_box.tag_remove("current_sentence", "1.0", "end")
-        self.reading_box.configure(state="disabled")
-        self._word_spans = [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
-        self._sentence_spans = [(m.start(), m.end()) for m in re.finditer(r"[^.!?]+[.!?]*", text, flags=re.S) if m.group(0).strip()]
-        self._word_to_sentence = []
-        if self._sentence_spans and self._word_spans:
-            s_idx = 0
-            for w_start, _ in self._word_spans:
-                while s_idx + 1 < len(self._sentence_spans) and w_start >= self._sentence_spans[s_idx][1]:
-                    s_idx += 1
-                self._word_to_sentence.append(s_idx)
-        self._last_highlighted_word = None
-
-    def _highlight_progress(self, word_index: int) -> None:
-        if not self._word_spans:
-            return
-        highlight_words = bool(self.highlight_words_var.get())
-        highlight_sentences = bool(self.highlight_sentences_var.get())
-        idx = max(0, min(word_index, len(self._word_spans) - 1))
-        sent_idx: int | None = None
-        if self._word_to_sentence and idx < len(self._word_to_sentence):
-            sent_idx = self._word_to_sentence[idx]
-        cache_key = (
-            idx if highlight_words else None,
-            sent_idx if highlight_sentences else None,
-            highlight_words,
-            highlight_sentences,
-        )
-        if cache_key == self._last_highlighted_word:
-            return
-        self.reading_box.configure(state="normal")
-        self.reading_box.tag_remove("current_word", "1.0", "end")
-        self.reading_box.tag_remove("current_sentence", "1.0", "end")
-        scroll_target = "1.0"
-        if highlight_sentences and sent_idx is not None and sent_idx < len(self._sentence_spans):
-            s_start, s_end = self._sentence_spans[sent_idx]
-            s_start_idx = f"1.0+{s_start}c"
-            s_end_idx = f"1.0+{s_end}c"
-            self.reading_box.tag_add("current_sentence", s_start_idx, s_end_idx)
-            scroll_target = s_start_idx
-        if highlight_words:
-            start_char, end_char = self._word_spans[idx]
-            w_start_idx = f"1.0+{start_char}c"
-            w_end_idx = f"1.0+{end_char}c"
-            self.reading_box.tag_add("current_word", w_start_idx, w_end_idx)
-            scroll_target = w_start_idx
-        if highlight_words or highlight_sentences:
-            self.reading_box.see(scroll_target)
-        self.reading_box.configure(state="disabled")
-        self._last_highlighted_word = cache_key
-
-    def _highlight_word(self, word_index: int) -> None:
-        # Backward-compatible wrapper for older call sites.
-        self._highlight_progress(word_index)
-
-    def _show_window(self, active: bool = True) -> None:
-        try:
-            self.root.deiconify()
-            self._apply_window_presentation()
-            if active:
-                self.root.lift()
-        except Exception:
-            pass
-
-    def _on_window_resize(self, event: Any) -> None:
-        if event.widget is not self.root:
-            return
-        try:
-            compact = self.root.winfo_height() < 320
-        except Exception:
-            return
-        if compact and not self._reading_panel_collapsed:
-            try:
-                self.reading_frame.pack_forget()
-                self._reading_panel_collapsed = True
-            except Exception:
-                pass
-        elif (not compact) and self._reading_panel_collapsed:
-            try:
-                self.reading_frame.pack(fill="both", expand=True, pady=(0, 6), before=self.controls)
-                self._reading_panel_collapsed = False
-            except Exception:
-                pass
-
-    def _on_close(self) -> None:
-        self.controller.cancel_translation()
-        if self.controller.is_speaking():
-            self.controller.stop()
-        self.ipc.stop()
-        self.root.destroy()
-
-    def run(self) -> None:
-        self.root.mainloop()
 
 
 def send_ipc(request: dict[str, Any], timeout: float = 1.0) -> dict[str, Any] | None:
@@ -3137,7 +2547,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Offline text-to-speech reader")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    gui_parser = sub.add_parser("gui", help="Run Voice Reading GUI")
+    gui_parser = sub.add_parser("gui", help="Open Voice Studio on the Reader tab")
     gui_parser.add_argument("--read-on-launch", action="store_true")
     gui_parser.add_argument("--translate-on-launch", action="store_true")
 
@@ -3159,12 +2569,14 @@ def main() -> int:
             translate_on_launch=bool(args.translate_on_launch),
         ):
             return 0
-        app = VoiceReadingGui(
-            read_on_launch=bool(args.read_on_launch),
-            translate_on_launch=bool(args.translate_on_launch),
-        )
-        app.run()
-        return 0
+        studio_argv = [sys.executable, str(SCRIPT_DIR / "voice_studio.py")]
+        if args.read_on_launch:
+            studio_argv.append("--read-on-launch")
+        elif args.translate_on_launch:
+            studio_argv.append("--translate-on-launch")
+        else:
+            studio_argv.extend(["--tab", "reader"])
+        os.execv(sys.executable, studio_argv)
     if args.command == "toggle":
         return cmd_toggle()
     if args.command == "read":

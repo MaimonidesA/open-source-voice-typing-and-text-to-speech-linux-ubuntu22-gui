@@ -5,15 +5,21 @@ Two cooperating apps, fully offline:
 - **Voice Typing** (`voice_typing.py`) — push-to-talk dictation: `Win+H` toggles recording, the transcript is inserted back into the field you were typing in (AT-SPI, with clipboard/paste fallback). Also hosts the **Ask Gemma** voice-assistant mode.
 - **Voice Reading** (`voice_reading.py`) — `Super+R` reads the currently selected text aloud (Piper neural voices or speech-dispatcher).
 
-Design notes and the full history of decisions live in [REMAKE_PLAN.md](REMAKE_PLAN.md). (`VOICE_TYPING_CONTEXT.md` and `VOICE_TYPING_REQUIREMENTS_STATUS.md` are historical snapshots.)
+Both run inside one window, **Voice Studio** (`voice_studio.py`), with Dictation, Reader and Settings tabs; see [Voice Studio](#voice-studio) below.
+
+Design notes and the history of the Gemma/Ollama decisions live in [REMAKE_PLAN.md](REMAKE_PLAN.md).
 
 ## Repo layout
 
 | Path | What it is |
 |------|------------|
-| `voice_typing.py` | Dictation app: GUI + IPC + recording + transcription + ask mode |
-| `voice_reading.py` | Read-aloud app: GUI + IPC + TTS + voice downloader |
-| `voice-toggle`, `voice-paste`, `voice-read` | Hotkey wrapper scripts (bind these in GNOME) |
+| `voice_typing.py` | Dictation engine: recording, transcription, delivery to the focused text box, ask mode, IPC + CLI |
+| `voice_reading.py` | Read-aloud engine: passage-by-passage TTS, translation, voice downloader, IPC + CLI |
+| `voice_studio.py`, `studio_widgets.py` | Voice Studio: the one window for both, the recording badge, the Reader document |
+| `tools/piper_gpu_wrapper.py`, `tools/piper_alignment.py` | CUDA Piper runtime and the exact word timings it reports |
+| `voice-toggle`, `voice-paste`, `voice-read`, `voice-translate` | Hotkey wrapper scripts (bind these in GNOME) |
+| `voice-studio.desktop.in`, `scripts/install_desktop_entry.sh` | Launcher so "Voice Studio" shows up in Activities search |
+| `tests/` | Offline tests: `python3 -m pytest tests` |
 | `config.example.json` | Reference for every voice-typing config key |
 | `systemd/` | User services for autostart (see below) |
 | `piper_runtime/piper/` | **Bundled** Piper TTS binary + libs — no install needed |
@@ -26,10 +32,10 @@ Design notes and the full history of decisions live in [REMAKE_PLAN.md](REMAKE_P
 
 ```bash
 sudo apt update
-sudo apt install -y sox wl-clipboard ydotool libnotify-bin python3-tk python3-pyatspi speech-dispatcher curl
+sudo apt install -y sox wl-clipboard xclip ydotool libnotify-bin python3-tk python3-pyatspi speech-dispatcher curl
 ```
 
-What each is for: `sox` (mic capture + audio analysis), `wl-clipboard` (Wayland clipboard), `ydotool` (key injection), `libnotify-bin` (desktop notifications), `python3-tk` (GUI), `python3-pyatspi` (insert-at-focus via accessibility), `speech-dispatcher` (fallback TTS engine for the reader).
+What each is for: `sox` (mic capture + audio analysis), `xclip` (sets the clipboard through Xwayland without taking focus; preferred for pasting), `wl-clipboard` (Wayland clipboard fallback), `ydotool` (key injection), `libnotify-bin` (desktop notifications), `python3-tk` (GUI), `python3-pyatspi` (insert-at-focus via accessibility), `speech-dispatcher` (fallback TTS engine for the reader).
 
 No pip packages are required — both apps are Python stdlib + the apt packages above.
 
@@ -124,13 +130,13 @@ chmod +x voice_typing.py voice-toggle voice_reading.py voice-read voice-translat
 
 ### 8. Autostart (systemd user services)
 
-`voice-typing-gui.service` is installed and enabled on this machine; the reader unit is optional:
+`voice-typing-gui.service` starts Voice Studio, which hosts both dictation and reading (edit the path in the unit if the repo lives elsewhere):
 
 ```bash
-cp systemd/voice-typing-gui.service systemd/voice-reading-gui.service ~/.config/systemd/user/
+cp systemd/voice-typing-gui.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now voice-typing-gui.service
-systemctl --user enable --now voice-reading-gui.service   # optional
+scripts/install_desktop_entry.sh   # "Voice Studio" in Activities search
 ```
 
 After editing the code, apply with: `systemctl --user restart voice-typing-gui.service`.
@@ -145,9 +151,9 @@ Settings → Keyboard → Custom Shortcuts:
 | `Super+R` | `/home/yaronbayrobee/Voice_typing/voice-read` |
 | `Super+Shift+T` | `/home/yaronbayrobee/Voice_typing/voice-translate` |
 
-If the GUI is already running the hotkey toggles it or starts translation; if not,
+If Voice Studio is already running the hotkey toggles recording or reading, or starts translation; if not,
 the first press launches it and starts recording, reading, or translating. The
-Reader Translation panel has a **Cancel** button that closes the active Ollama
+Reader's translation pane has a **Cancel** button that closes the active Ollama
 stream. Starting a new translation also cancels the previous one.
 
 ## File and data paths
@@ -160,6 +166,20 @@ stream. Starting a new translation also cancels the previous one.
 | `/tmp/voice_typing/` | Runtime state: current WAV, chunks, `routing.log` |
 | `/tmp/voice_typing.sock`, `/tmp/voice_reading.sock` | IPC sockets (hotkey ↔ GUI) |
 
+## Voice Studio
+
+`voice_typing.py gui` and `voice_reading.py gui` (the systemd service and the hotkey scripts) open **Voice Studio**, one window that hosts both apps in the same process. Both IPC sockets are unchanged, so every hotkey works as before.
+
+- **Dictation tab** — mic button, mode (Whisper / Gemma agent / Ask Gemma), dictation translation, the latest transcript and where it went.
+- **Recording badge** — while recording, a small floating mic with a timer and a live level meter appears at the bottom of the primary monitor. It is an override-redirect window, so it never takes keyboard focus from the text box you are dictating into. Click it to stop. After each take it briefly shows *Transcribing…*, then *Pasted* or *Copied to clipboard*, or an error. Settings → Window and recording badge turns it off or moves it to the top.
+- **Reader tab** — an editable document. The read hotkey replaces its text with the current selection and starts reading, as before. The text is read passage by passage and the next passages are synthesized in the background, so **text you paste below the current passage keeps playing without a gap**. Edits to passages not yet spoken are read as edited. ▶ reads from the cursor (after you click in the text), otherwise continues where reading stopped. Ctrl+Enter reads from the cursor, Esc stops, and right-click → *Read from here*. Changing the voice or speed while reading re-reads the current passage with the new setting. *Translate* translates the selection, or all the text, into the translation pane, where *Read it* reads the translation in the target language.
+- **Settings tab** — every option in one place: Dictation, Reader, Local AI (Ollama; the context size and address are shared, and dictation and translation keep separate models because Gemma agent needs an audio-capable one), Audio devices (microphone and speaker), Performance (GPU for Whisper and Piper, how long a Piper voice stays loaded), Window and badge, and the current hotkeys.
+- **Word-by-word highlighting follows the voice exactly** with the GPU Piper runtime (Settings → Reader → *Highlight the word being read*). Piper voices decide how long every phoneme lasts before generating audio; `tools/piper_alignment.py` exposes those durations by adding an output to the voice model in memory (the `.onnx` files are not modified), and each word of the passage is matched to its phonemes, so numbers like "2026" or "3:45" that are spoken as several words still line up. With the CPU Piper binary and speech-dispatcher the word position is estimated from the passage length. `highlight_delay_seconds` in `reading_config.json` (default 0.06) shifts the highlight to match your speaker's latency.
+- Closing the window only hides it; hotkeys keep working. Search "Voice Studio" in Activities (after `scripts/install_desktop_entry.sh`) to bring it back, and use Settings → *Quit Voice Studio* to exit.
+- The window is a "utility" window, like the old dictation panel. It never takes focus when a hotkey shows it, but it does not appear in the Activities overview or Alt+Tab.
+- Piper stays loaded between passages (`--json-input` mode, also added to `tools/piper_gpu_wrapper.py`), so a warm GPU voice synthesizes a passage in about 0.2–0.3 s instead of 2.5 s per call. `piper_keep_warm_seconds` in `reading_config.json` (default 300) releases it after reading has been idle that long.
+- Tk has no right-to-left layout, so Hebrew shows in reversed letter order on screen (as in the old windows); it is still read correctly.
+
 ## Operation modes (one click / one command)
 
 | Profile | What it does |
@@ -169,7 +189,7 @@ stream. Starting a new translation also cancels the previous one.
 | `gemma-agent` | Fully-offline gemma4 STT via Ollama in 28 s rolling chunks. For machines without whisper.cpp (robot). |
 | `antonio` | Experimental wake-word assistant ("hey antonio"). |
 
-Switch from the GUI ("Mode:" buttons) or terminal: `./voice_typing.py set-profile stable`.
+Switch on the Dictation tab (**Mode**) or from a terminal: `./voice_typing.py set-profile stable`.
 
 Ask Gemma from the terminal too:
 
@@ -192,15 +212,15 @@ or click **Retry Last Audio** in the GUI. Whisper transcription timeouts scale w
 
 ## Model switching
 
-**Whisper models** — drop `ggml-*.bin` files into `~/whisper.cpp/models` (or run the download script in step 3), then the model dropdown in the GUI, or:
+**Whisper models** — drop `ggml-*.bin` files into `~/whisper.cpp/models` (or run the download script in step 3), then pick it in Settings → Dictation → **Whisper model**, or:
 
 ```bash
 ./voice_typing.py list-models
 ./voice_typing.py set-model ggml-small.en.bin
 ```
 
-For Hebrew, French, Italian, or mixed-language dictation, use the GUI's
-`Speech language: auto` setting and a multilingual model such as
+For Hebrew, French, Italian, or mixed-language dictation, use
+**Speech language: auto** (Settings → Dictation) and a multilingual model such as
 `ggml-small.bin` (the `.en` models are English-only). Gemma transcription is
 also instructed to preserve the original language and Unicode script.
 
@@ -213,48 +233,49 @@ ollama pull gemma4:12b
 
 The selected Ollama model is used for both gemma-agent transcription and ask-gemma answers.
 
-Speech-to-text does not translate by default. In the Voice Typing top bar, enable
-**Translate**, choose English/Hebrew/French/Italian, and optionally enable
-**Speak**. When Translate is enabled, every take uses multilingual Whisper for
+Speech-to-text does not translate by default. On the Dictation tab, turn on
+**Translate what I dictate into**, choose English/Hebrew/French/Italian, and optionally
+**Speak it**. When Translate is enabled, every take uses multilingual Whisper for
 the original spoken language, sends the completed transcript to the selected
 Ollama/Gemma model, and routes the translated text to the original target field
 and clipboard. When Speak is enabled, the translated text is sent to the
 language-aware Voice Reading process, which selects the target-language voice.
-The **Translate take** button remains available for a one-shot translation even
-when the Translate checkbox is off. Translation takes wait for the complete
+The **Translate a take** button remains available for a one-shot translation even
+when that switch is off. Translation takes wait for the complete
 Whisper transcript so untranslated partials are never pasted.
 
-**Reader voices (Piper)** — the **Get Voices** button in the reader GUI, or:
+**Reader voices (Piper)** — Settings → Reader → **Get more voices…**, or:
 
 ```bash
 ./voice_reading.py list-gb-voices
 ./voice_reading.py download-voice en_GB-jenny_dioco-medium
-./voice_reading.py translate       # translate the current selection in the Reader GUI
+./voice_reading.py translate       # translate the current selection in the Reader tab
 ```
 
-then **Refresh Models** and pick the voice in the Model dropdown. Voices land in `piper_voices/`; the reader also scans `~/.local/share/piper[/voices]`, `~/.cache/piper`, `/usr/share/piper[-voices]`, `/opt/piper/voices`.
+then pick the voice in the Reader tab's **Voice** list (Settings → Reader → **Refresh voices** if it is missing). Voices land in `piper_voices/`; the reader also scans `~/.local/share/piper[/voices]`, `~/.cache/piper`, `/usr/share/piper[-voices]`, `/opt/piper/voices`.
 
 The bundled Piper index includes French (`fr_FR`) and Italian (`it_IT`) voices as
 well as English. The downloader also adds the Hebrew `he_IL-phonikud-medium`
 voice, which downloads a Piper-compatible Hebrew checkpoint and its Phonikud
 phonemizer. Install the optional Python adapter first with
 `python3 -m pip install -r requirements-hebrew-tts.txt`; then open **Get
-Voices**, select the Hebrew row, and click **Download Selected**. The Hebrew
+more voices…**, select the Hebrew row, and click **Download selected**. The Hebrew
 download is about 364 MB and is kept under `piper_voices/he/`.
 The Reader selects default voices by language when installed: English
 `en_GB-cori-high`, French `fr_FR-upmc-medium`, and Italian
 `it_IT-paola-medium`, and Hebrew `he_IL-phonikud-medium`. The downloader marks
 these recommendations; download a default once if it is not installed.
 
-**Reader translation** — select text, open the Reader panel, choose English,
-Hebrew, French, or Italian, and press **Translate**. The text is sent only to
-the configured local Ollama/Gemma server and the result appears as text in the
-Translation panel. **Copy Translation** puts it on the clipboard. The Reader
-also has a **Speak** option for reading the translated result aloud.
+**Reader translation** — on the Reader tab press **Translate**: the selection in
+the Reader text, or all of it (or the system selection when it is empty), is
+translated into English, Hebrew, French, or Italian. The text is sent only to
+the configured local Ollama/Gemma server and the result appears in the
+translation pane. **Copy** puts it on the clipboard, **Read it** reads it in the
+target language, and **Speak** reads every new translation automatically.
 
-Voice Typing and Voice Reading are separate windows but use the same local
-Ollama API. They keep separate model settings intentionally. In the Reader's
-Settings, use **Translation Model** and **Refresh Models** to choose any model
+Dictation and reading use the same local Ollama API but keep separate model
+settings intentionally (Gemma agent dictation needs an audio-capable model). In
+Settings → Local AI, pick the **Translation model (Reader)** from any model
 installed in Ollama, such as `gemma4:latest` or `gemma4:12b-it-qat`. The active
 model is logged for every translation request. A larger model may improve
 translation quality, but it is not inherently faster and uses more VRAM.
@@ -283,14 +304,24 @@ Full reference with defaults: [config.example.json](config.example.json). Highli
 - `transcription_engine`: `whisper`, `ollama`, or `gemma4-transformers`.
 - `recording_max_seconds` (1800) / `recording_warn_before_seconds` (30); `0` = unlimited (use with rolling chunks).
 - `audio_input_device` — empty/default uses the desktop default mic; set with `./voice_typing.py list-audio-inputs` and `./voice_typing.py set-audio-input ...`.
+- `audio_output_device` (in `reading_config.json`) — the speaker the Reader talks through, picked from the **Audio Output** dropdown in the Reader Settings panel; empty means the desktop default. Piper and espeak are pointed at the sink directly, while speech-dispatcher speech is moved onto it just after it starts.
 - `save_recordings` (true) / `recordings_dir` / `recordings_keep` (30) — the archive.
 - `streaming_transcription` + `streaming_chunk_seconds` — rolling chunks while talking (Gemma is clamped to ≤30 s).
 - `ollama_model`, `ollama_url`, `ollama_keep_alive` (30m, keeps the model warm), `ollama_context_tokens` (`num_ctx`, default 2048), `ollama_max_tokens`, `ollama_disable_thinking` (true — **important**: gemma4 otherwise burns its whole token budget on hidden reasoning and returns nothing), `ollama_normalize_audio` (true — Gemma needs louder input than Whisper), `ollama_frequency_penalty` (0.5 — damps repetition loops).
 - `assistant_answer_mode` — the ask-gemma switch; `answer_speak_aloud` (true), `answer_voice_model`, `ollama_ask_system_prompt`, `ollama_answer_max_tokens` (600).
 - `language` (`auto`, `en`, `he`, `fr`, `it`) and `always_copy_hotkey_to_clipboard` — multilingual transcription and guaranteed clipboard recovery for hotkey takes.
 - `auto_paste_current_focus`, `paste_fallback_for_hotkey`, `restore_clipboard_after_paste`, `copy_to_clipboard_when_started_from_gui`, `window_always_on_top` — routing/window behavior. The panel is not always-on-top by default so it cannot steal the target field's focus.
+- `paste_shortcut_overrides` — paste key per app (AT-SPI app name), e.g. `{"code": "ctrl+shift+v"}`; values `ctrl+v`, `ctrl+shift+v`, `shift+insert`. Default is Ctrl+Shift+V for terminals and Ctrl+V elsewhere. VS Code's integrated terminal only pastes with Ctrl+Shift+V, while its Markdown editor opens a preview on Ctrl+Shift+V.
 - Hotkey delivery uses full clipboard paste first. `direct_type_max_chars_for_hotkey` defaults to `0` so long transcripts are never truncated by simulated keyboard typing; set a small positive value only if a target application cannot paste.
 - `voice_commands_enabled`, `assistant_wake_mode`, `assistant_wake_phrases` — wake-word/assistant extras.
+
+## Tests
+
+```bash
+python3 -m pytest tests
+```
+
+Offline and silent: playback is replaced by `sleep`, and the desktop (focus, clipboard, ydotool) is stubbed. The Piper tests use the bundled CPU runtime and the GPU runtime when they are installed, and are skipped otherwise.
 
 ## Troubleshooting
 
@@ -305,11 +336,14 @@ Full reference with defaults: [config.example.json](config.example.json). Highli
 - **Blank transcript right after pressing the hotkey** → duplicate GNOME shortcut events are ignored: toggles inside 0.8 s are dropped, and hotkey-started recordings cannot be stopped for the first 1.5 s.
 - **Blank audio / wrong microphone** → run `./voice_typing.py list-audio-inputs`, then choose a source such as `./voice_typing.py set-audio-input pulse:alsa_input.usb-MUSIC-BOOST_Trust_GXT_232_Microphone-00.mono-fallback`; if a pinned Pulse source disappears, recording is refused with a microphone error instead of being reported as a time limit. Truly silent captures are skipped before Whisper.
 - **Transcript goes to the wrong app** → the hotkey flow only trusts the focus target captured at start. If no reliable starting text box is found, the transcript is copied to the clipboard instead of being pasted into whatever happens to be focused later.
+- **Transcript only lands on the clipboard** → check the `route: start=... current=... same_window=...` line in the routing log. `same_window=False` means the window that had focus at the start hotkey was no longer focused when the text was ready; GNOME does not let other programs re-activate it, so the text is left on the clipboard.
 - **Reader stop/start does not stop audio** → the reader now stops the current TTS/player process group before starting a new GUI or `read` request. `toggle` still means stop when already reading.
-- **Reader highlight timing** → Piper debug output provides generated audio duration per sentence, so sentence highlighting follows actual sentence boundaries. Piper does not provide exact word timestamps in this setup; word highlighting is therefore off by default and remains an optional estimated mode in Settings.
+- **Reader highlight timing** → the passage highlight starts exactly when its audio starts. Word highlighting is exact with the GPU Piper runtime (timings come from the voice model) and estimated otherwise; if it runs slightly ahead of or behind your speaker, adjust `highlight_delay_seconds` in `reading_config.json`.
 - **Lost a transcription** → it isn't lost: `./voice_typing.py retranscribe`.
 - Routing decisions are logged to `/tmp/voice_typing/routing.log`.
 
 ## Notes on "type only where I started"
 
-On Wayland, generic direct focus control is restricted. This implementation uses accessibility (AT-SPI) to target the original field when supported by the app. If unavailable, it safely uses clipboard fallback instead of uncontrolled key spam.
+On Wayland, generic direct focus control is restricted: GNOME 41+ refuses `org.gnome.Shell.Eval`, so no outside program can re-activate another app's window. The start hotkey therefore records which top-level window is active (AT-SPI `ACTIVE` state; VS Code and other Electron apps expose their windows even though they hide their text fields). When the transcript is ready it is pasted only if that same window still has focus. If focus moved, the text goes into the original field through AT-SPI when the app supports it, and otherwise stays on the clipboard. If no accessible window was active at the start (the desktop, an app without AT-SPI), it pastes best-effort into the current focus.
+
+The clipboard is set with `xclip` through Xwayland when available. `wl-copy`/`wl-paste` on GNOME map a tiny window of their own to reach the clipboard, which takes keyboard focus away from the text box right before the paste keystroke.

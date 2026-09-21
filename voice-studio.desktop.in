@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Voice Studio
+Comment=Dictation and read-aloud: offline voice typing and text to speech
+Exec=/usr/bin/python3 @REPO@/voice_studio.py
+Icon=audio-input-microphone
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=voice;dictation;speech;tts;read aloud;whisper;piper;
+StartupWMClass=VoiceStudio
